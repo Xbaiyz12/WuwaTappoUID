@@ -1,0 +1,9 @@
+[
+  {
+    "platform": "填写 GS event.bot_id，例如 onebot",
+    "user_id": "填写平台用户 ID",
+    "cuid": "填写纯数字 CUID",
+    "domestic": 1,
+    "token": "填写该 CUID 已有的有效 token"
+  }
+]

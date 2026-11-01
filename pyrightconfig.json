@@ -1,0 +1,4 @@
+{
+  "typeCheckingMode": "basic",
+  "extraPaths": ["../gsuid_core-reference", "../../.."]
+}

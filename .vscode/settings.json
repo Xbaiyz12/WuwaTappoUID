@@ -1,0 +1,5 @@
+{
+  "python.analysis.extraPaths": ["../gsuid_core-reference", "../../.."],
+  "editor.formatOnSave": true,
+  "[python]": {"editor.defaultFormatter": "charliermarsh.ruff"}
+}

@@ -1,0 +1,2 @@
+# SQLModel、Pydantic 和 APScheduler 复用 gsuid_core 环境。
+aiohttp>=3.10,<4
