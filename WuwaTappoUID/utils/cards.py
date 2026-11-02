@@ -289,16 +289,18 @@ class Cards:
         header = replace(context.header, available=available)
         return await self.draw(header, "开箱结果", cards, note, context.progress)
 
-    async def backpack(self, account: Account, items: list[Item], event: Event) -> list[bytes]:
+    async def backpack(self, account: Account, items: list[Item], event: Event, kind: str | None = None) -> list[bytes]:
         info = UserInfo.model_validate_json(account.info)
         header = await self.header(account, info.remaining, event)
         progress = self.progress(items)
         header.available = None
         header.collected = (sum(row.owned for row in progress), sum(row.total for row in progress))
-        groups: dict[str, list[Item]] = {kind: [] for kind in KINDS}
+        groups: dict[str, list[Item]] = {name: [] for name in KINDS} if kind is None else {kind: []}
         for item in items:
             if item.quantity > 0:
-                groups.setdefault(self.kind(item.asset_id, item.asset_type), []).append(item)
+                item_kind = self.kind(item.asset_id, item.asset_type)
+                if kind is None or item_kind == kind:
+                    groups.setdefault(item_kind, []).append(item)
         images = []
         for kind, entries in groups.items():
             cards = [
@@ -336,13 +338,19 @@ class Cards:
         async with self._draw_lock:
             return await asyncio.to_thread(render_atlas_card, header, title, groups, progress, note)
 
-    async def atlas(self, account: Account, items: list[Item], event: Event, kind: str) -> bytes:
+    async def atlas(self, account: Account, items: list[Item], event: Event, kind: str | None = None) -> list[bytes]:
         quantities = {str(item.asset_id): item.quantity for item in items}
         progress = self.progress(items)
         info = UserInfo.model_validate_json(account.info)
         header = await self.header(account, info.remaining, event)
         header.available = None
         header.collected = (sum(row.owned for row in progress), sum(row.total for row in progress))
+        kinds = list(KINDS) if kind is None else [kind]
+        return [await self.atlas_kind(header, quantities, progress, name) for name in kinds]
+
+    async def atlas_kind(
+        self, header: Header, quantities: dict[str, int], progress: list[Progress], kind: str
+    ) -> bytes:
         entries = self.catalog_group(kind)
         loaded = await self.item_cards(
             [Item(asset_id=entry.asset, asset_type=kind, rarity=entry.rarity) for entry in entries]

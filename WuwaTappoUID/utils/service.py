@@ -109,6 +109,9 @@ class Service:
             except ApiError as error:
                 if error.code not in CODE_TOKEN_INVALID:
                     raise
+                logger.info(
+                    f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：user/me 登录态失效，错误码 {error.code}，重登中。"
+                )
                 info = await self.renew_session(account)
         if str(info.cuid) != account.cuid:
             raise DataError("服务端返回的 CUID 与绑定账号不一致，已停止本次操作。")
@@ -121,11 +124,16 @@ class Service:
         # 登录中断也是一轮汇总边界；先保存已有结果，不让登录失败吞掉它们。
         await self.queue_results(account.id, force=True, reason="登录态失效，汇总已开结果")
         player_id, server_id = await self.login_role(account.cuid, account.domestic)
+        stage = "auth/login"
         try:
             account.token = await self.api.login(account.cuid, account.domestic, player_id, server_id)
+            stage = "user/me"
             info = await self.api.me(account.token)
-        except (ApiError, DataError):
+        except (ApiError, DataError) as error:
+            reason = f"错误码 {error.code}" if isinstance(error, ApiError) else "响应结构不符合接口定义"
+            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：重登失败，阶段 {stage}，{reason}。")
             raise AuthenticationError("登录态失效，重新登录仍未成功；请重新绑定后发送 wt恢复。") from None
+        logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：重登成功。")
         await self.account_notice(account, "登录态已失效，已根据 CUID 重新登录。")
         return info
 
@@ -359,7 +367,7 @@ class Service:
     def refresh_hint(previous_token: str, account: Account) -> str:
         return "\n登录态已更新：已根据 CUID 重新登录。" if previous_token != account.token else ""
 
-    async def query(self, event: Event, bag: bool = False) -> list[str | bytes]:
+    async def query(self, event: Event, bag: bool = False, kind: str | None = None) -> list[str | bytes]:
         owner = identity(event.bot_id, event.user_id)
         async with self.user_lock(owner):
             _, account = await self.bound(event)
@@ -369,7 +377,7 @@ class Service:
                 items = await self.read_bag(account) if bag else None
         # 绘图只读取本次快照，不占用自动开箱所需的账号锁。
         if items is not None:
-            answer: list[str | bytes] = list(await self.cards.backpack(account, items, event))
+            answer: list[str | bytes] = list(await self.cards.backpack(account, items, event, kind))
         else:
             image = await self.cards.click_summary(account, event)
             hint = self.refresh_hint(previous_token, account)
@@ -377,16 +385,16 @@ class Service:
         await self.flush_notices()
         return answer
 
-    async def atlas(self, event: Event, kind: str) -> list[bytes]:
+    async def atlas(self, event: Event, kind: str | None = None) -> list[bytes]:
         owner = identity(event.bot_id, event.user_id)
         async with self.user_lock(owner):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
                 await self.refresh(account)
                 items = await self.read_bag(account)
-        image = await self.cards.atlas(account, items, event, kind)
+        images = await self.cards.atlas(account, items, event, kind)
         await self.flush_notices()
-        return [image]
+        return images
 
     async def read_bag(self, account: Account) -> list[Item]:
         try:
@@ -432,6 +440,10 @@ class Service:
                     except ApiError as error:
                         record.state, record.error = "rejected", str(error)
                         await Store.save(record)
+                        if error.code in CODE_TOKEN_INVALID:
+                            logger.info(
+                                f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：合成登录态失效，错误码 {error.code}。"
+                            )
                         if error.code in CODE_TOKEN_INVALID and not relogged:
                             relogged = True
                             try:

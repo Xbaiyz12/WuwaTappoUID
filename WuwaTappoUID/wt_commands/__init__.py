@@ -104,11 +104,16 @@ async def wt_command(bot: Bot, event: Event) -> None:
             mode = argument or "升阶"
             await bot.send(f"开始{mode}合成多余物品：每种保留 1 件，本轮只进行{mode}合成。")
             replies = await service.synthesize(event, same_level=mode == "同阶")
-        elif command == "图鉴":
+        elif command in ("背包", "图鉴"):
             kinds = {"角色": "character", "配件": "accessory", "表情": "emote"}
-            if argument not in kinds:
-                raise WuwaError("用法：wt图鉴 角色、wt图鉴 配件，或 wt图鉴 表情。")
-            replies = await service.atlas(event, kinds[argument])
+            if argument and argument not in kinds:
+                raise WuwaError(f"用法：wt{command} [角色/配件/表情]；不带参数查看全部分类。")
+            kind = kinds[argument] if argument else None
+            replies = (
+                await service.query(event, bag=True, kind=kind)
+                if command == "背包"
+                else await service.atlas(event, kind)
+            )
         elif argument:
             raise WuwaError("这条命令不需要参数，可发送 wt帮助 查看用法。")
         elif command == "查看":
@@ -117,8 +122,6 @@ async def wt_command(bot: Bot, event: Event) -> None:
             replies = [await service.subscribe(event, command == "订阅")]
         elif command == "信息":
             replies = await service.info(event)
-        elif command == "背包":
-            replies = await service.query(event, bag=True)
         elif command == "次数":
             replies = await service.query(event)
         elif command == "宝箱":
