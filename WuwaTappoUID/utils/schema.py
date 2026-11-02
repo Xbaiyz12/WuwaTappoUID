@@ -1,5 +1,6 @@
 """游戏接口的数据结构；缺失必要字段属于接口错误。"""
 
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field, JsonValue
@@ -8,7 +9,10 @@ BASE = "https://api-mc-wuwatappo.kurogames-global.com"
 ORIGIN = "http://tauri.localhost"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 WuwaTappo/1.0"
 CODE_OK = (0, 200)
-CODE_TOKEN_INVALID = (10002, 10003)
+CODE_TOKEN_INVALID = (10002, 10003, 90002)
+TOKEN_LIFETIME = 7 * 24 * 3600
+TOKEN_RENEW_WINDOW = 2 * 24 * 3600
+TOKEN_RENEW_RETRY = 5 * 60
 TASK_SECONDS = 24 * 3600
 RENEW_WINDOW = 60 * 60
 AUTO_CLICKS = 10_000
@@ -24,11 +28,15 @@ class WuwaError(Exception):
 
 
 class ApiError(WuwaError):
-    def __init__(self, code: int):
+    def __init__(self, code: int | None, *, http_status: int | None = None, path: str = "", request_id: str = ""):
         self.code = code
+        self.http_status = http_status
+        self.path = path
+        self.request_id = request_id
         messages = {
-            10002: "登录态失效（10002）",
-            10003: "登录态失效（10003）",
+            10002: "登录鉴权被拒绝（10002）",
+            10003: "登录鉴权被拒绝（10003）",
+            90002: "账号已在其他设备登录（90002）",
             10014: "服务端正在处理另一项操作（10014）",
             70004: "当前没有可用宝箱（70004）",
             70005: "点击不足（70005）",
@@ -36,7 +44,20 @@ class ApiError(WuwaError):
             50002: "合成失败（50002）",
             50006: "未拥有该物品（50006）",
         }
-        super().__init__(messages.get(code, f"游戏接口返回错误（{code}）"))
+        message = (
+            f"请求鉴权被拒绝（HTTP {http_status}，无业务错误码）"
+            if code is None
+            else messages.get(code, f"游戏接口返回错误（{code}）")
+        )
+        super().__init__(message)
+
+    @property
+    def is_auth(self) -> bool:
+        return self.code in CODE_TOKEN_INVALID or self.code is None and self.http_status in (401, 403)
+
+    @property
+    def details(self) -> str:
+        return f"接口 {self.path}，HTTP {self.http_status}，业务码 {self.code}，请求 ID {self.request_id or '未提供'}"
 
 
 class NetworkError(WuwaError):
@@ -48,7 +69,7 @@ class DataError(WuwaError):
 
 
 class AuthenticationError(WuwaError):
-    """登录态失效且无法重新登录。"""
+    """登录态未确认，停止写操作；已取得的新 token 不回退或重复登录。"""
 
 
 class Expired(Exception):
@@ -58,10 +79,33 @@ class Expired(Exception):
 class Envelope(BaseModel):
     code: int
     data: JsonValue = None
+    result: JsonValue = None
+    request_id: str = ""
+
+    def payload(self) -> JsonValue:
+        if not ({"data", "result"} & self.model_fields_set):
+            raise DataError("游戏接口响应缺少 data/result，请管理员检查接口。")
+        return self.data if self.data is not None else self.result
 
 
 class LoginData(BaseModel):
-    token: str
+    token: str = Field(min_length=1, repr=False)
+    expire_time: int | float | str | None = None
+
+
+def token_expiry(value: int | float | str | None) -> float:
+    if value is None or value == "":
+        return 0
+    if isinstance(value, str) and not value.replace(".", "", 1).isdigit():
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            raise DataError("登录响应的 expire_time 格式无法识别。") from None
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone(timedelta(hours=8)))
+        return stamp.timestamp()
+    number = float(value)
+    return number / 1000 if number >= 1_000_000_000_000 else number
 
 
 class DesktopCharacter(BaseModel):
@@ -188,3 +232,4 @@ class SessionImport(BaseModel):
     cuid: str = Field(pattern=r"^[0-9]+$")
     domestic: Literal[0, 1] = 1
     token: str = Field(min_length=1, repr=False)
+    expire_time: int | float | str | None = None

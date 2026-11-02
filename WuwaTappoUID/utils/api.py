@@ -77,6 +77,7 @@ class WuwaAPI:
         self.session = aiohttp.ClientSession(
             headers={"Accept": "application/json", "User-Agent": UA, "Origin": ORIGIN, "Referer": ORIGIN + "/"},
             timeout=aiohttp.ClientTimeout(total=25),
+            cookie_jar=aiohttp.DummyCookieJar(),
         )
 
     async def close(self) -> None:
@@ -90,27 +91,39 @@ class WuwaAPI:
 
     async def fetch(
         self, url: str, method: str = "GET", payload: object = None, token: str = "", *, retry: bool = True
-    ) -> JsonValue:
-        async def request() -> JsonValue:
+    ) -> Envelope:
+        async def request() -> Envelope:
             return await self._fetch_once(url, method, payload, token)
 
         return await retry_network(request, "接口请求") if retry else await request()
 
-    async def _fetch_once(self, url: str, method: str, payload: object, token: str) -> JsonValue:
+    async def _fetch_once(self, url: str, method: str, payload: object, token: str) -> Envelope:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        path = url.removeprefix(BASE).split("?", 1)[0]
         try:
             async with self.client().request(method, url, json=payload, headers=headers) as response:
+                request_id = response.headers.get("x-request-id", "")
+                try:
+                    envelope = Envelope.model_validate_json(await response.text())
+                except ValidationError:
+                    if response.status in (401, 403):
+                        raise ApiError(None, http_status=response.status, path=path, request_id=request_id) from None
+                    if response.status >= 500 or response.status in (408, 429):
+                        raise NetworkError(f"服务端暂不可用（HTTP {response.status}）。") from None
+                    raise DataError(f"接口 {path} 未返回有效业务响应（HTTP {response.status}）。") from None
+                request_id = envelope.request_id or request_id
+                if envelope.code not in CODE_OK:
+                    raise ApiError(envelope.code, http_status=response.status, path=path, request_id=request_id)
                 if response.status in (401, 403):
-                    raise ApiError(10002)
+                    raise ApiError(None, http_status=response.status, path=path, request_id=request_id)
                 if response.status >= 500 or response.status in (408, 429):
                     raise NetworkError(f"服务端暂不可用（HTTP {response.status}），稍后再查询。")
                 if response.status >= 400:
                     raise DataError(f"请求被拒绝（HTTP {response.status}），请管理员检查接口。")
-                return JSON.validate_json(await response.text())
+                return envelope
         except (aiohttp.ClientError, TimeoutError):
+            logger.warning(f"[WuwaTappoUID] 接口 {path} 网络中断或超时，未判定为 token 失效。")
             raise NetworkError("网络请求失败或超时，暂时无法确认服务端结果。") from None
-        except ValidationError:
-            raise DataError("服务端没有返回有效 JSON 数据。") from None
 
     async def download(self, url: str, limit: int = 4_000_000, *, etag: str = "", last_modified: str = "") -> Download:
         async def request() -> Download:
@@ -148,12 +161,14 @@ class WuwaAPI:
     async def request(
         self, path: str, method: str = "POST", payload: object = None, token: str = "", *, retry: bool = True
     ) -> JsonValue:
-        result = parse(Envelope, await self.fetch(BASE + path, method, payload, token, retry=retry))
-        if result.code not in CODE_OK:
-            raise ApiError(result.code)
-        return result.data
+        try:
+            response = await self.fetch(BASE + path, method, payload, token, retry=retry)
+        except ApiError as error:
+            logger.warning(f"[WuwaTappoUID] 接口拒绝请求：{error.details}。")
+            raise
+        return response.payload()
 
-    async def login(self, cuid: str, domestic: int, player_id: int | str = 0, server_id: str = "0") -> str:
+    async def login(self, cuid: str, domestic: int, player_id: int | str = 0, server_id: str = "0") -> LoginData:
         """字段形状对齐官方客户端；accessToken 一次性随机生成，插件不持有任何真实凭据。"""
         payload = {
             "cuid": cuid,
@@ -167,10 +182,14 @@ class WuwaAPI:
             "serverId": server_id,
             "is_domestic": domestic,
         }
-        result = parse(LoginData, await self.request("/api/auth/login", payload=payload))
-        if not result.token:
-            raise DataError("登录接口未返回有效登录态。")
-        return result.token
+        result = parse(LoginData, await self.request("/api/auth/login", payload=payload, retry=False))
+        return result
+
+    async def renew_token(self, token: str) -> None:
+        # 续期延长服务端期限，超时不盲目重复；仍保留原 token。
+        result = await self.request("/api/frontend/user/renew-token", "GET", token=token, retry=False)
+        if result is not True:
+            raise DataError("token 续期接口未返回 true，原会话已保留。")
 
     async def roles(self, cuid: str, domestic: int) -> list[RoleInfo]:
         """不需要登录的角色查询；只读，可以随网络重试。"""
@@ -254,6 +273,12 @@ class WuwaAPI:
                                 raise Expired
                             await ws.send_str("42" + json.dumps(["cr", {"num": total}], separators=(",", ":")) + ",1")
                             sent_clicks = True
+                        elif message.startswith("42"):
+                            event = JSON.validate_json(message[2:])
+                            if isinstance(event, list) and len(event) >= 2 and event[0] == "fd":
+                                body = event[1]
+                                if isinstance(body, dict) and isinstance(body.get("c"), int):
+                                    raise ApiError(body["c"], path="/socket.io:fd")
                         elif message.startswith("43") and sent_clicks:
                             # 部分服务端在 43 后携带 ACK id，正文从 [ 或 { 开始。
                             starts = [i for i in (message.find("["), message.find("{")) if i >= 0]
@@ -266,8 +291,12 @@ class WuwaAPI:
                                 raise DataError("点击确认帧格式已变化。")
                             code = body["c"]
                             if code in CODE_TOKEN_INVALID:
-                                raise ApiError(code)
+                                raise ApiError(code, path="/socket.io:cr")
                             return code
+        except aiohttp.WSServerHandshakeError as error:
+            if error.status in (401, 403):
+                raise ApiError(None, http_status=error.status, path="/socket.io:connect") from None
+            raise NetworkError(f"点击连接握手失败（HTTP {error.status}），需回读实际点击数。") from None
         except (aiohttp.ClientError, TimeoutError):
             raise NetworkError("点击提交失败或超时，需重新查询实际点击数。") from None
         except ValidationError:

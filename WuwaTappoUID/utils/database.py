@@ -26,6 +26,9 @@ class Account(SQLModel, table=True):
     token: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
     info: str = Field(default="", sa_column=Column(Text, nullable=False))
     verified_at: float = 0
+    token_expires_at: float = 0
+    token_renew_after: float = 0
+    token_state: str = Field(default="ready", max_length=32)
     subscribed: bool = False
 
 
@@ -128,7 +131,12 @@ class SynthesisRecord(SQLModel, table=True):
 
 # create_all 不给旧表补列；只在首次新增 subscribed 时开启现有账号的订阅。
 ADDED_COLUMNS = {
-    "wt_account": {"subscribed": "BOOLEAN NOT NULL DEFAULT FALSE"},
+    "wt_account": {
+        "subscribed": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "token_expires_at": "FLOAT NOT NULL DEFAULT 0",
+        "token_renew_after": "FLOAT NOT NULL DEFAULT 0",
+        "token_state": "VARCHAR(32) NOT NULL DEFAULT 'ready'",
+    },
     "wt_chest_task": {"paused_at": "FLOAT"},
     "wt_chest_record": {"notice_id": "VARCHAR(32) NOT NULL DEFAULT ''"},
     "wt_notice": {

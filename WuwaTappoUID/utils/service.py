@@ -22,23 +22,27 @@ from .formatting import date_text, mask_cuid, task_text
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
-    CODE_TOKEN_INVALID,
     NET_SERVER_IDS,
     RENEW_WINDOW,
     SETTLE_SECONDS,
     SIDE_NAMES,
     TASK_SECONDS,
+    TOKEN_LIFETIME,
+    TOKEN_RENEW_RETRY,
+    TOKEN_RENEW_WINDOW,
     ApiError,
     AuthenticationError,
     DataError,
     Expired,
     Item,
+    LoginData,
     NetworkError,
     RoleInfo,
     Side,
     SynthesisResult,
     UserInfo,
     WuwaError,
+    token_expiry,
 )
 from .synthesis import highest_tiers, next_recipe
 
@@ -95,44 +99,93 @@ class Service:
         if task is not None and task.status in ("active", "paused"):
             await Store.save(Notice(subscription_id=task.subscription_id, account_id=account.id, text=text))
 
-    async def refresh(self, account: Account, force_login: bool = False) -> UserInfo:
+    async def refresh(self, account: Account) -> UserInfo:
         # 调用方进入账号锁前可能已读取绑定，锁内以数据库中最新 token 为准。
         saved = await Store.account(account.id)
         if saved is not None:
             account.token = saved.token
             account.subscribed = saved.subscribed
-        if force_login:
+            account.token_expires_at = saved.token_expires_at
+            account.token_renew_after = saved.token_renew_after
+            account.token_state = saved.token_state
+            account.info = saved.info
+            account.verified_at = saved.verified_at
+        pending = account.token_state == "pending"
+        if account.token_state == "ready":
+            await self.renew_token_if_needed(account)
+        try:
+            info = await self.api.me(account.token)
+        except ApiError as error:
+            if not error.is_auth:
+                raise
+            # 新取得的 token 只验证，不在同一失败周期中再次登录。
+            logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：账号查询鉴权失败，{error.details}。")
+            if account.token_state != "ready":
+                raise AuthenticationError(
+                    "当前会话验证未通过，已保留 token 并停止操作，不会重复登录；请稍后查询或添加有效 token。"
+                ) from None
             info = await self.renew_session(account)
-        else:
-            try:
-                info = await self.api.me(account.token)
-            except ApiError as error:
-                if error.code not in CODE_TOKEN_INVALID:
-                    raise
-                logger.info(
-                    f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：user/me 登录态失效，错误码 {error.code}，重登中。"
-                )
-                info = await self.renew_session(account)
         if str(info.cuid) != account.cuid:
             raise DataError("服务端返回的 CUID 与绑定账号不一致，已停止本次操作。")
         account.info = info.model_dump_json()
         account.verified_at = time.time()
+        account.token_state = "ready"
         await Store.save(account)
+        if pending:
+            await self.account_notice(account, "新会话已验证，继续使用已保存的 token。")
         return info
 
-    async def renew_session(self, account: Account) -> UserInfo:
-        # 登录中断也是一轮汇总边界；先保存已有结果，不让登录失败吞掉它们。
-        await self.queue_results(account.id, force=True, reason="登录态失效，汇总已开结果")
-        player_id, server_id = await self.login_role(account.cuid, account.domestic)
-        stage = "auth/login"
+    async def renew_token_if_needed(self, account: Account) -> None:
+        now = time.time()
+        if account.token_renew_after > now:
+            return
+        if account.token_expires_at and account.token_expires_at - now >= TOKEN_RENEW_WINDOW:
+            return
         try:
-            account.token = await self.api.login(account.cuid, account.domestic, player_id, server_id)
-            stage = "user/me"
+            await self.api.renew_token(account.token)
+        except WuwaError as error:
+            account.token_renew_after = now + TOKEN_RENEW_RETRY
+            await Store.save(account)
+            reason = error.details if isinstance(error, ApiError) else type(error).__name__
+            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：token 续期未确认，保留原会话；{reason}。")
+            return
+        account.token_expires_at = max(now, account.token_expires_at) + TOKEN_LIFETIME
+        account.token_renew_after = 0
+        await Store.save(account)
+        logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：原 token 续期成功，未重新登录。")
+
+    async def save_login_token(self, account: Account, login: LoginData) -> None:
+        # 先保存新 token，期限解析或账号验证失败也不能再恢复数据库中的旧 token。
+        account.token = login.token
+        account.token_state = "pending"
+        account.token_expires_at = 0
+        account.token_renew_after = 0
+        await Store.save(account)
+        account.token_expires_at = token_expiry(login.expire_time)
+        await Store.save(account)
+
+    async def renew_session(self, account: Account) -> UserInfo:
+        # 只有账号查询已拒绝当前会话才进入本函数。
+        await self.queue_results(account.id, force=True, reason="账号查询鉴权失败，汇总已开结果")
+        player_id, server_id = await self.login_role(account.cuid, account.domestic)
+        # 发请求前保存状态。登录结果不明时，下次只验证现有 token，不自动再发登录请求。
+        account.token_state = "login_unconfirmed"
+        await Store.save(account)
+        try:
+            login = await self.api.login(account.cuid, account.domestic, player_id, server_id)
+        except (ApiError, DataError) as error:
+            reason = error.details if isinstance(error, ApiError) else "响应结构不符合接口定义"
+            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：登录未完成，阶段 auth/login，{reason}。")
+            raise AuthenticationError("登录未完成，已停止操作，不会重复提交登录；请添加有效 token。") from None
+        await self.save_login_token(account, login)
+        try:
             info = await self.api.me(account.token)
         except (ApiError, DataError) as error:
-            reason = f"错误码 {error.code}" if isinstance(error, ApiError) else "响应结构不符合接口定义"
-            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：重登失败，阶段 {stage}，{reason}。")
-            raise AuthenticationError("登录态失效，重新登录仍未成功；请重新绑定后发送 wt恢复。") from None
+            reason = error.details if isinstance(error, ApiError) else "响应结构不符合接口定义"
+            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：新 token 已保存，阶段 user/me，{reason}。")
+            raise AuthenticationError("新 token 已保存但验证未通过；请稍后查询，不会再次自动登录。") from None
+        if str(info.cuid) != account.cuid:
+            raise DataError("新 token 所属 CUID 与绑定账号不一致，已保存待核对会话并停止操作。")
         logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：重登成功。")
         await self.account_notice(account, "登录态已失效，已根据 CUID 重新登录。")
         return info
@@ -145,8 +198,15 @@ class Service:
                 account = await Store.account(target)
                 if account is None:
                     player_id, server_id = await self.login_role(cuid, domestic)
-                    token = await self.api.login(cuid, domestic, player_id, server_id)
-                    account = Account(id=target, cuid=cuid, domestic=domestic, token=token)
+                    account = Account(id=target, cuid=cuid, domestic=domestic, token_state="login_unconfirmed")
+                    await Store.save(account)
+                    login = await self.api.login(cuid, domestic, player_id, server_id)
+                    await self.save_login_token(account, login)
+                elif account.token_state == "login_unconfirmed" and not account.token:
+                    # 用户再次显式绑定无 token 的账号，允许开启一次新的登录尝试。
+                    player_id, server_id = await self.login_role(cuid, domestic)
+                    login = await self.api.login(cuid, domestic, player_id, server_id)
+                    await self.save_login_token(account, login)
                 previous_token = account.token
                 await self.refresh(account)
                 await Store.save(
@@ -175,6 +235,9 @@ class Service:
                     account = Account(id=target, cuid=cuid, domestic=domestic)
                 # refresh 会优先使用数据库里的旧 token；新会话验证后直接保存。
                 account.token = token
+                account.token_state = "ready"
+                account.token_expires_at = 0
+                account.token_renew_after = 0
                 account.info = info.model_dump_json()
                 account.verified_at = time.time()
                 await Store.save(
@@ -400,9 +463,9 @@ class Service:
         try:
             return await self.api.bags(account.token)
         except ApiError as error:
-            if error.code not in CODE_TOKEN_INVALID:
+            if not error.is_auth:
                 raise
-            await self.refresh(account, force_login=True)
+            await self.refresh(account)
             return await self.api.bags(account.token)
 
     async def synthesize(self, event: Event, same_level: bool = False) -> list[str | bytes]:
@@ -440,14 +503,18 @@ class Service:
                     except ApiError as error:
                         record.state, record.error = "rejected", str(error)
                         await Store.save(record)
-                        if error.code in CODE_TOKEN_INVALID:
+                        if error.is_auth:
                             logger.info(
-                                f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：合成登录态失效，错误码 {error.code}。"
+                                f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：合成鉴权被拒绝，{error.details}。"
                             )
-                        if error.code in CODE_TOKEN_INVALID and not relogged:
+                        if error.is_auth and not relogged:
                             relogged = True
+                            previous_token = account.token
                             try:
-                                await self.refresh(account, force_login=True)
+                                await self.refresh(account)
+                                if account.token == previous_token:
+                                    problem = "合成请求被拒绝，但账号查询确认原 token 可用；已保留会话并停止本轮。"
+                                    break
                                 items = await self.read_bag(account)
                             except WuwaError as login_error:
                                 problem = str(login_error)
@@ -509,7 +576,6 @@ class Service:
         before = await self.refresh(account)
         self.check_deadline(task)
         problem = ""
-        force_login = False
         submission_error = None
         try:
             ack = await self.api.set_clicks(
@@ -518,13 +584,12 @@ class Service:
             if ack != 0:
                 problem = str(ApiError(ack))
         except ApiError as error:
-            force_login = error.code in CODE_TOKEN_INVALID
             problem = str(error)
         except (NetworkError, DataError) as error:
             submission_error = error
             problem = str(error)
         # 重连只提交固定目标累计值；最终仍按服务端实际变化作答。
-        after = await self.refresh(account, force_login=force_login)
+        after = await self.refresh(account)
         delta = after.total_click_count - before.total_click_count
         if task is not None and delta <= 0 and submission_error is not None:
             raise submission_error
@@ -875,10 +940,13 @@ class Service:
                     if delta > 0:
                         continue
                     raise WuwaError(supplement + "本次未重试开箱。")
-                if error.code in CODE_TOKEN_INVALID:
-                    # 明确被鉴权拒绝，可以更新登录态，但本次不再次提交开箱。
-                    await self.refresh(account, force_login=True)
-                    raise NetworkError("开箱时登录态失效，已更新登录态，稍后重新检查。") from None
+                if error.is_auth:
+                    # 先验证原会话，本次不再次提交开箱。
+                    previous_token = account.token
+                    await self.refresh(account)
+                    if account.token == previous_token:
+                        raise WuwaError("开箱请求被拒绝，但原 token 仍可查询；会话已保留，本次停止开箱。") from None
+                    raise NetworkError("开箱请求鉴权失败，账号查询确认后已恢复会话，稍后重新检查。") from None
                 if supplement:
                     await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}。\n{supplement}")
                 raise
@@ -967,10 +1035,10 @@ class Service:
                 )
             except ApiError as error:
                 interrupted = True
-                if error.code in CODE_TOKEN_INVALID:
+                if error.is_auth:
                     task.status = "paused"
                     task.pause_reason = "auth"
-                    text = "重新登录仍然失败，自动开箱已暂停。请重新绑定后发送 wt恢复。"
+                    text = f"请求鉴权未通过：{error}。自动开箱已暂停，请查询账号或添加有效 token 后发送 wt恢复。"
                 else:
                     task.failures += 1
                     task.status = "paused" if task.failures >= 5 else "active"

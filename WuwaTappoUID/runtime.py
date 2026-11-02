@@ -13,7 +13,7 @@ from pydantic import TypeAdapter, ValidationError
 from .utils.api import WuwaAPI
 from .utils.database import Account, AccountLink, Binding, Store, migrate_notice_columns
 from .utils.resources import Resources
-from .utils.schema import DataError, SessionImport
+from .utils.schema import DataError, SessionImport, token_expiry
 from .utils.service import Service, account_id, identity
 
 ROOT = get_res_path("WuwaTappoUID")
@@ -46,6 +46,7 @@ async def import_sessions() -> None:
                 token=entry.token,
                 info=info.model_dump_json(),
                 verified_at=time.time(),
+                token_expires_at=token_expiry(entry.expire_time),
             )
         )
     for entry, account in zip(entries, verified, strict=True):
