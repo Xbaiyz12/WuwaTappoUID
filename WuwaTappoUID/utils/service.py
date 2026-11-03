@@ -20,15 +20,17 @@ from .api import WuwaAPI, with_read_cache
 from .cards import Cards, ResultContext
 from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
 from .failures import Failures
-from .formatting import date_text, mask_cuid, task_text
+from .formatting import account_text, date_text, mask_cuid, role_text, task_text
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
+    MAX_CLICK_INCREMENT,
     NET_SERVER_IDS,
     RENEW_WINDOW,
     SETTLE_SECONDS,
     SIDE_NAMES,
     TASK_SECONDS,
+    TOKEN_EXPIRED_MESSAGE,
     TOKEN_LIFETIME,
     TOKEN_RENEW_RETRY,
     TOKEN_RENEW_WINDOW,
@@ -38,14 +40,12 @@ from .schema import (
     DataError,
     Expired,
     Item,
-    LoginData,
     NetworkError,
     RoleInfo,
     Side,
     SynthesisResult,
     UserInfo,
     WuwaError,
-    token_expiry,
 )
 from .settings import retry_limit
 from .synthesis import highest_tiers, next_recipe
@@ -56,7 +56,7 @@ NOTICE_CACHE_BYTES = 32 * 1024 * 1024
 @dataclass
 class CachedNoticeImage:
     revision: int
-    body: bytes
+    body: tuple[bytes, ...]
 
 
 def identity(platform: str, user_id: str) -> str:
@@ -105,7 +105,6 @@ class Service:
         )
         logger.error(f"[WuwaTappoUID] {message} {type(error).__name__}：{detail}")
         await self.failures.fail("database", "数据库故障", detail, limit=1)
-        await self.failures.flush_alerts()
 
     @staticmethod
     def error_detail(error: Exception) -> str:
@@ -135,19 +134,12 @@ class Service:
                 Notice(
                     subscription_id=task.subscription_id,
                     account_id=task.account_id,
-                    text=f"后台检查连续失败达到上限（{failure.attempts}次），已暂停并生成主人告警。"
-                    f"\n{self.error_detail(error)}\n处理后可用 wt恢复 重置重试计数。",
+                    text=f"后台任务持续异常（{failure.attempts}次），已暂停并提醒主人检查。"
+                    f"\n{self.error_detail(error)}\n问题处理后可用 wt恢复 继续任务。",
                 ),
             )
         else:
             await Store.save(task)
-
-    async def command_failure(self, event: Event, command: str, error: Exception, failure_key: str) -> None:
-        await self.failures.fail(
-            failure_key,
-            f"命令 wt{command}（用户 {event.user_id}）",
-            self.error_detail(error),
-        )
 
     def account_lock(self, key: str) -> asyncio.Lock:
         return self._accounts.setdefault(key, asyncio.Lock())
@@ -155,19 +147,64 @@ class Service:
     def user_lock(self, key: str) -> asyncio.Lock:
         return self._users.setdefault(key, asyncio.Lock())
 
-    async def bound(self, event: Event) -> tuple[Binding, Account]:
+    async def user_binding(self, event: Event) -> Binding:
         binding = await Store.binding(identity(event.bot_id, event.user_id))
         if binding is None:
-            raise WuwaError("请先发送 wt绑定 CUID 或 wt添加token TOKEN（海外账号加上海外）。")
+            raise WuwaError("请先发送 wt登录 或 wt添加token TOKEN（海外账号加上海外）。")
+        return binding
+
+    async def bound(self, event: Event, *, allow_expired: bool = False) -> tuple[Binding, Account]:
+        binding = await self.user_binding(event)
         account = await Store.account(binding.account_id)
         if account is None:
             raise WuwaError("绑定的账号数据缺失，请重新绑定。")
+        if account.token_state == "expired" and not allow_expired:
+            raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
         return binding, account
+
+    async def expire_account(self, account: Account) -> None:
+        """已确认 token 失效；只通知一次，更新有效 token 后恢复鉴权暂停的任务。"""
+        was_expired = account.token_state == "expired"
+        account.token_state = "expired"
+        task = await Store.task(account.id)
+        if task is not None and task.status in ("active", "paused"):
+            if task.status == "active":
+                task.status = "paused"
+                task.pause_reason = "auth"
+            rows = [account, task]
+            if not was_expired:
+                rows.append(
+                    Notice(
+                        subscription_id=task.subscription_id,
+                        account_id=account.id,
+                        text=f"{date_text(time.time())}：token已过期，自动开箱已暂停。"
+                        "请发送 wt登录 或 wt添加token 更新；因token过期暂停的有效任务将自动恢复。",
+                    )
+                )
+            await Store.save(*rows)
+            self.schedule(task)
+        elif not was_expired:
+            await Store.save(account)
 
     async def account_notice(self, account: Account, text: str) -> None:
         task = await Store.task(account.id)
         if task is not None and task.status in ("active", "paused"):
             await Store.save(Notice(subscription_id=task.subscription_id, account_id=account.id, text=text))
+
+    async def account_reply(
+        self, account: Account, roles: list[RoleInfo], note: str, task: ChestTask | None, event: Event
+    ) -> list[str | bytes]:
+        try:
+            image = await self.cards.account_summary(account, roles, note, task, event)
+        except SQLAlchemyError:
+            raise
+        except Exception:
+            logger.exception("[WuwaTappoUID] 账号数据已取得，图片绘制失败，返回文字")
+        else:
+            return [image]
+        info = UserInfo.model_validate_json(account.info)
+        summary = account_text(info, account.domestic, role_text(roles))
+        return ["账号数据已取得，图片暂不可用。\n" + summary + ("\n" + note if note else "") + "\n" + task_text(task)]
 
     async def refresh(self, account: Account, *, fresh: bool = False) -> UserInfo:
         # 调用方进入账号锁前可能已读取绑定，锁内以数据库中最新 token 为准。
@@ -180,30 +217,24 @@ class Service:
             account.token_state = saved.token_state
             account.info = saved.info
             account.verified_at = saved.verified_at
-        pending = account.token_state == "pending"
-        if account.token_state == "ready":
-            await self.renew_token_if_needed(account)
+        if account.token_state == "expired":
+            raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
         try:
             info = await self.api.me(account.token, fresh=fresh)
         except ApiError as error:
             if not error.is_auth:
                 raise
-            # 新取得的 token 只验证，不在同一失败周期中再次登录。
-            logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：账号查询鉴权失败，{error.details}。")
-            if account.token_state != "ready":
-                raise AuthenticationError(
-                    "当前会话验证未通过，已保留 token 并停止操作，不会重复登录；请稍后查询或添加有效 token。"
-                ) from None
-            info = await self.renew_session(account)
+            await self.expire_account(account)
+            raise AuthenticationError(TOKEN_EXPIRED_MESSAGE) from None
         if str(info.cuid) != account.cuid:
             raise DataError("服务端返回的 CUID 与绑定账号不一致，已停止本次操作。")
+        if info.is_domestic is not None and info.is_domestic != account.domestic:
+            raise DataError("服务端返回的区服与绑定账号不一致，已停止本次操作。")
         account.info = info.model_dump_json()
         account.verified_at = time.time()
         account.token_state = "ready"
         await Store.save(account)
-        await self.failures.success("auth:" + account.id)
-        if pending:
-            await self.account_notice(account, "新会话已验证，继续使用已保存的 token。")
+        await self.renew_token_if_needed(account)
         return info
 
     async def renew_token_if_needed(self, account: Account) -> None:
@@ -220,14 +251,16 @@ class Service:
         except WuwaError as error:
             account.token_renew_after = now + TOKEN_RENEW_RETRY
             await Store.save(account)
+            if isinstance(error, ApiError) and error.is_auth:
+                try:
+                    await self.api.me(account.token, fresh=True)
+                except ApiError as confirmation:
+                    if confirmation.is_auth:
+                        await self.expire_account(account)
+                        raise AuthenticationError(TOKEN_EXPIRED_MESSAGE) from None
+                    raise
             reason = self.error_detail(error)
-            failure = await self.failures.fail(failure_key, "原token续期", reason, account.id, delay=TOKEN_RENEW_RETRY)
-            if failure.blocked:
-                await self.account_notice(
-                    account,
-                    f"原token续期连续失败{failure.attempts}次，已停止自动续期并生成主人告警。"
-                    "原token仍会继续查询验证；可用 wt恢复 或添加有效token重置计数。",
-                )
+            await self.failures.fail(failure_key, "后台token续期", reason, account.id, delay=TOKEN_RENEW_RETRY)
             return
         account.token_expires_at = max(now, account.token_expires_at) + TOKEN_LIFETIME
         account.token_renew_after = 0
@@ -235,72 +268,45 @@ class Service:
         await self.failures.success(failure_key)
         logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：原 token 续期成功，未重新登录。")
 
-    async def save_login_token(self, account: Account, login: LoginData) -> None:
-        # 先保存新 token，期限解析或账号验证失败也不能再恢复数据库中的旧 token。
-        account.token = login.token
-        account.token_state = "pending"
-        account.token_expires_at = 0
-        account.token_renew_after = 0
-        await Store.save(account)
-        await self.failures.success("renew:" + account.id)
-        await self.failures.success("auth:" + account.id)
-        account.token_expires_at = token_expiry(login.expire_time)
-        await Store.save(account)
-
-    async def renew_session(self, account: Account) -> UserInfo:
-        # 只有账号查询已拒绝当前会话才进入本函数。
-        await self.queue_results(account.id, force=True, reason="账号查询鉴权失败，汇总已开结果")
-        player_id, server_id = await self.login_role(account.cuid, account.domestic)
-        # 发请求前保存状态。登录结果不明时，下次只验证现有 token，不自动再发登录请求。
-        account.token_state = "login_unconfirmed"
-        await Store.save(account)
+    async def resume_after_token(self, account: Account, info: UserInfo) -> str:
+        """调用方持有账号锁；只恢复因鉴权失效暂停的有效任务。"""
+        task = await Store.task(account.id)
+        if task is None or task.status not in ("active", "paused"):
+            return "当前没有待恢复的宝箱任务。"
+        if task.status == "active":
+            return "宝箱任务继续运行。"
+        if task.pause_reason != "auth":
+            return "宝箱任务保持暂停，可用 wt恢复 操作。"
+        if task.remaining() <= 0:
+            await self.finish(task, "expired", "本轮已到期")
+            return "宝箱任务已到期，请用 wt宝箱 开启新的24小时任务。"
         try:
-            login = await self.api.login(account.cuid, account.domestic, player_id, server_id)
-        except (ApiError, DataError) as error:
-            reason = error.details if isinstance(error, ApiError) else "响应结构不符合接口定义"
-            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：登录未完成，阶段 auth/login，{reason}。")
-            raise AuthenticationError("登录未完成，已停止操作，不会重复提交登录；请添加有效 token。") from None
-        await self.save_login_token(account, login)
-        try:
-            info = await self.api.me(account.token)
-        except (ApiError, DataError) as error:
-            reason = error.details if isinstance(error, ApiError) else "响应结构不符合接口定义"
-            logger.warning(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：新 token 已保存，阶段 user/me，{reason}。")
-            raise AuthenticationError("新 token 已保存但验证未通过；请稍后查询，不会再次自动登录。") from None
-        if str(info.cuid) != account.cuid:
-            raise DataError("新 token 所属 CUID 与绑定账号不一致，已保存待核对会话并停止操作。")
-        logger.info(f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：重登成功。")
-        await self.account_notice(account, "登录态已失效，已根据 CUID 重新登录。")
-        return info
-
-    async def bind(self, event: Event, cuid: str, domestic: int) -> list[str | bytes]:
-        owner = identity(event.bot_id, event.user_id)
-        target = account_id(cuid, domestic)
-        async with self.user_lock(owner):
-            async with self.account_lock(target):
-                account = await Store.account(target)
-                if account is None:
-                    player_id, server_id = await self.login_role(cuid, domestic)
-                    account = Account(id=target, cuid=cuid, domestic=domestic, token_state="login_unconfirmed")
-                    await Store.save(account)
-                    login = await self.api.login(cuid, domestic, player_id, server_id)
-                    await self.save_login_token(account, login)
-                elif account.token_state == "login_unconfirmed" and not account.token:
-                    # 用户再次显式绑定无 token 的账号，允许开启一次新的登录尝试。
-                    player_id, server_id = await self.login_role(cuid, domestic)
-                    login = await self.api.login(cuid, domestic, player_id, server_id)
-                    await self.save_login_token(account, login)
-                previous_token = account.token
-                await self.refresh(account)
-                await Store.save(
-                    Binding(id=owner, platform=event.bot_id, user_id=event.user_id, account_id=target),
-                    AccountLink(owner_id=owner, account_id=target),
-                )
-                roles, role_note = await self.role_details(account)
-                task = await Store.task(account.id)
-        await self.flush_notices()
-        image = await self.cards.account_summary(account, roles, role_note, task, event)
-        return ["绑定成功，已切换到该账号。" + self.refresh_hint(previous_token, account), image]
+            if not await self.reconcile(task, info):
+                return "登录成功，但任务尚未恢复：开箱结果仍待确认，可稍后用 wt恢复。"
+        except WuwaError as error:
+            return f"登录成功，但任务尚未恢复：{error}；可稍后用 wt恢复。"
+        if task.remaining() <= 0:
+            await self.finish(task, "expired", "本轮已到期")
+            return "宝箱任务已到期，请用 wt宝箱 开启新的24小时任务。"
+        if task.paused_at is not None:
+            task.expires_at += time.time() - task.paused_at
+        task.paused_at = None
+        task.status = "active"
+        task.pause_reason = ""
+        task.failures = 0
+        task.next_check = self.next_wakeup(task, info)
+        await self.failures.reset_account(account.id)
+        await Store.reset_notice_attempts(account.id)
+        await Store.save(
+            task,
+            Notice(
+                subscription_id=task.subscription_id,
+                account_id=account.id,
+                text="token已更新，宝箱任务已自动恢复，继续剩余有效期。",
+            ),
+        )
+        self.schedule(task)
+        return "宝箱任务已自动恢复，继续剩余有效期。"
 
     async def bind_token(self, event: Event, token: str, domestic: int | None = None) -> list[str | bytes]:
         owner = identity(event.bot_id, event.user_id)
@@ -313,6 +319,12 @@ class Service:
                     domestic = 0 if str(info.server_id) in NET_SERVER_IDS else 1
             target = account_id(cuid, domestic)
             async with self.account_lock(target):
+                # 等锁期间凭据和游戏状态可能改变；不能拿锁外验证快照覆盖当前账号。
+                info = await self.api.me(token, fresh=True)
+                if str(info.cuid) != cuid:
+                    raise DataError("锁内验证的CUID与首次验证不一致，本次未保存token。")
+                if info.is_domestic is not None and info.is_domestic != domestic:
+                    raise WuwaError("token所属区服与指定区服不同，本次未保存；请指定正确区服。")
                 account = await Store.account(target)
                 if account is None:
                     account = Account(id=target, cuid=cuid, domestic=domestic)
@@ -328,13 +340,21 @@ class Service:
                     Binding(id=owner, platform=event.bot_id, user_id=event.user_id, account_id=target),
                     AccountLink(owner_id=owner, account_id=target),
                 )
-                await self.failures.reset_account(account.id)
-                await Store.reset_notice_attempts(account.id)
+                await self.failures.success("renew:" + account.id)
+                try:
+                    resume_note = await self.resume_after_token(account, info)
+                except SQLAlchemyError:
+                    raise
+                except Exception as error:
+                    detail = self.error_detail(error)
+                    logger.error(f"[WuwaTappoUID] token更新成功但任务恢复失败：{detail}")
+                    resume_note = f"登录成功，但任务尚未恢复：{detail}；可稍后用 wt恢复。"
                 roles, role_note = await self.role_details(account)
                 task = await Store.task(account.id)
         await self.flush_notices()
-        image = await self.cards.account_summary(account, roles, role_note, task, event)
-        return ["token 登录成功，已获取 CUID 并绑定为当前账号。", image]
+        reply = await self.account_reply(account, roles, role_note, task, event)
+        notice = "token 登录成功，已绑定为当前账号。\n" + resume_note
+        return [notice, *reply]
 
     @staticmethod
     def select_account(accounts: list[Account], reference: str, domestic: int | None) -> Account:
@@ -360,21 +380,24 @@ class Service:
         async with self.user_lock(owner):
             accounts = await Store.linked_accounts(owner)
             if not accounts:
-                raise WuwaError("请先发送 wt绑定 CUID 或 wt添加token TOKEN。")
+                raise WuwaError("请先发送 wt登录 或 wt添加token TOKEN。")
             lines = ["已绑定的 CUID："]
             for index, account in enumerate(accounts, 1):
-                lines.append(f"[{index}] {mask_cuid(account.cuid)}（{'国服' if account.domestic else '海外'}）")
+                status = " · token已过期" if account.token_state == "expired" else ""
+                lines.append(f"[{index}] {mask_cuid(account.cuid)}（{'国服' if account.domestic else '海外'}）{status}")
         return "\n".join(lines) + "\nwt切换 [x] 切换账号；wt删除 [x] 删除绑定。"
 
     async def delete_account(self, event: Event, cuid: str = "", domestic: int | None = None) -> str:
         owner = identity(event.bot_id, event.user_id)
         async with self.user_lock(owner):
-            binding, _ = await self.bound(event)
+            binding = await self.user_binding(event)
             accounts = await Store.linked_accounts(owner)
             if cuid:
                 target = self.select_account(accounts, cuid, domestic)
             else:
-                target = next(a for a in accounts if a.id == binding.account_id)
+                target = next((a for a in accounts if a.id == binding.account_id), None)
+                if target is None:
+                    raise WuwaError("当前绑定的账号数据缺失，请先重新绑定或切换到已有账号后再删除。")
             async with self.account_lock(target.id):
                 task = await Store.task(target.id)
                 stopped = task is not None and task.owner_id == owner and task.status in ("active", "paused")
@@ -400,34 +423,32 @@ class Service:
         if event.user_pm > 1:
             raise WuwaError("wt状态仅限 Bot 管理员使用。")
         if not self.database_ready:
-            return (
-                f"WT 已停止\n{self.database_error}\n连续失败上限：{retry_limit()} 次"
-                f"\n主人告警待处理：{len(self.failures.state.alerts)} 条"
-            )
+            return f"WT 已停止\n{self.database_error}\n连续失败上限：{retry_limit()} 次"
         bound_people, task_people, total_chests = await Store.statistics()
         return (
             f"WT 状态\n绑定人数：{bound_people} 人\n开启任务人数：{task_people} 人（含暂停）"
             f"\n累计成功开箱：{total_chests} 个"
             f"\n连续失败上限：{retry_limit()} 次"
-            f"\n已停止重试的阶段：{sum(item.blocked for item in self.failures.state.failures.values())} 个"
-            f"\n主人告警待处理：{len(self.failures.state.alerts)} 条"
         )
 
     async def switch(self, event: Event, cuid: str = "", domestic: int | None = None) -> str:
         owner = identity(event.bot_id, event.user_id)
         async with self.user_lock(owner):
-            binding, _ = await self.bound(event)
+            binding = await self.user_binding(event)
             accounts = await Store.linked_accounts(owner)
+            if not accounts:
+                raise WuwaError("没有可切换的有效账号，请先重新绑定。")
             if cuid:
                 target = self.select_account(accounts, cuid, domestic)
             else:
-                current = next(i for i, a in enumerate(accounts) if a.id == binding.account_id)
-                target = accounts[(current + 1) % len(accounts)]
+                current = next((i for i, a in enumerate(accounts) if a.id == binding.account_id), None)
+                target = accounts[0] if current is None else accounts[(current + 1) % len(accounts)]
             binding.account_id = target.id
             await Store.save(binding)
         return (
             f"已切换到 CUID {mask_cuid(target.cuid)}（{'国服' if target.domestic else '海外'}）。"
             "原账号的任务、订阅及推送位置不变。"
+            + ("\n" + TOKEN_EXPIRED_MESSAGE if target.token_state == "expired" else "")
         )
 
     async def subscribe(self, event: Event, enabled: bool) -> str:
@@ -463,7 +484,7 @@ class Service:
         for (run_id, subscription_id), records in grouped.items():
             send_rest = force or task is None or task.run_id != run_id or task.status not in ("active", "paused")
             while records and (send_rest or account.subscribed and len(records) >= 10):
-                # 订阅按十件推送；未订阅的待发结果完整汇总为一张图。
+                # 订阅按十件推送；未订阅保留整轮通知，绘图入口按页绘制。
                 size = min(len(records), 10) if account.subscribed else len(records)
                 batch, records = records[:size], records[size:]
                 notice = Notice(
@@ -476,17 +497,6 @@ class Service:
                 for record in batch:
                     record.notice_id = notice.id
                 await Store.save(*batch, notice)
-
-    async def login_role(self, cuid: str, domestic: int) -> tuple[int | str, str]:
-        """登录载荷里的角色字段；查不到就沿用占位值，登录本身不依赖它。"""
-        try:
-            roles = await self.api.roles(cuid, domestic)
-        except WuwaError:
-            return 0, "0"
-        for role in roles:
-            if role.playerId and role.serverId:
-                return role.playerId, role.serverId
-        return 0, "0"
 
     async def role_details(self, account: Account) -> tuple[list[RoleInfo], str]:
         """角色只用于展示：查询失败不影响绑定和其他命令。"""
@@ -510,39 +520,26 @@ class Service:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
-                previous_token = account.token
                 await self.refresh(account)
                 roles, role_note = await self.role_details(account)
                 task = await Store.task(account.id)
         await self.flush_notices()
-        image = await self.cards.account_summary(account, roles, role_note, task, event)
-        hint = self.refresh_hint(previous_token, account)
-        return [hint, image] if hint else [image]
-
-    def refresh_hint(self, previous_token: str, account: Account) -> str:
-        hint = "\n登录态已更新：已根据 CUID 重新登录。" if previous_token != account.token else ""
-        if self.failures.blocked("renew:" + account.id):
-            hint += "\n原token续期失败达到上限，自动续期已停止并生成主人告警；wt恢复 可重置计数。"
-        return hint
+        reply = await self.account_reply(account, roles, role_note, task, event)
+        return reply
 
     async def query(self, event: Event, bag: bool = False, kind: str | None = None) -> list[str | bytes]:
         owner = identity(event.bot_id, event.user_id)
         async with self.user_lock(owner):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
-                previous_token = account.token
                 await self.refresh(account)
                 items = await self.read_bag(account) if bag else None
         # 绘图只读取本次快照，不占用自动开箱所需的账号锁。
         if items is not None:
             answer: list[str | bytes] = list(await self.cards.backpack(account, items, event, kind))
-            hint = self.refresh_hint(previous_token, account)
-            if hint:
-                answer.insert(0, hint)
         else:
             image = await self.cards.click_summary(account, event)
-            hint = self.refresh_hint(previous_token, account)
-            answer = [hint, image] if hint else [image]
+            answer = [image]
         await self.flush_notices()
         return answer
 
@@ -551,13 +548,9 @@ class Service:
         async with self.user_lock(owner):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
-                previous_token = account.token
                 await self.refresh(account)
                 items = await self.read_bag(account)
         images: list[str | bytes] = list(await self.cards.atlas(account, items, event, kind))
-        hint = self.refresh_hint(previous_token, account)
-        if hint:
-            images.insert(0, hint)
         await self.flush_notices()
         return images
 
@@ -568,7 +561,7 @@ class Service:
             if not error.is_auth:
                 raise
             await self.refresh(account, fresh=True)
-            return await self.api.bags(account.token, fresh=True)
+            raise
 
     async def synthesize(self, event: Event, same_level: bool = False) -> list[str | bytes]:
         results: list[SynthesisResult] = []
@@ -580,13 +573,9 @@ class Service:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
-                failure_key = "synthesis:" + account.id
-                if self.failures.blocked(failure_key):
-                    raise WuwaError("合成连续失败已达到上限，处理后请用 wt恢复 重置计数。")
                 await self.refresh(account)
                 items = await self.read_bag(account)
                 highest = {} if same_level else highest_tiers(await self.api.atlas())
-                relogged = False
                 while True:
                     try:
                         recipe = next_recipe(items, highest, same_level=same_level)
@@ -595,6 +584,8 @@ class Service:
                         break
                     if recipe is None:
                         break
+                    if results:
+                        await asyncio.sleep(1)
                     record = SynthesisRecord(
                         run_id=run_id,
                         account_id=account.id,
@@ -612,19 +603,13 @@ class Service:
                             logger.info(
                                 f"[WuwaTappoUID] CUID {mask_cuid(account.cuid)}：合成鉴权被拒绝，{error.details}。"
                             )
-                        if error.is_auth and not relogged:
-                            relogged = True
-                            previous_token = account.token
+                        if error.is_auth:
                             try:
                                 await self.refresh(account, fresh=True)
-                                if account.token == previous_token:
-                                    problem = "合成请求被拒绝，但账号查询确认原 token 可用；已保留会话并停止本轮。"
-                                    break
-                                items = await self.read_bag(account, fresh=True)
-                            except WuwaError as login_error:
-                                problem = str(login_error)
-                                break
-                            continue
+                                problem = "合成请求被拒绝，但账号查询确认token可用；本轮已停止。"
+                            except WuwaError as confirmation:
+                                problem = str(confirmation)
+                            break
                         problem = f"服务端拒绝本次合成：{error}，本轮已停止。"
                         break
                     except WuwaError as error:
@@ -651,10 +636,6 @@ class Service:
                     if record.before_quantity - record.after_quantity != len(recipe.asset_ids) - 1:
                         problem = "服务端背包数量尚未与合成消耗一致，本轮已停止；请用 wt背包 核对。"
                         break
-        if problem:
-            await self.failures.fail(failure_key, "合成批次", problem, account.id)
-        else:
-            await self.failures.success(failure_key)
         await self.flush_notices()
         summary = f"本轮已确认：升阶 {upgrades} 次，同阶 {same_count} 次。"
         summary += f"消耗多余物品 {spent} 件，获得 {len(results)} 件。"
@@ -705,24 +686,15 @@ class Service:
         return after, delta, problem
 
     async def increase(self, event: Event, number: int) -> list[str | bytes]:
+        if not 1 <= number <= MAX_CLICK_INCREMENT:
+            raise WuwaError(f"单次增加次数须为 1～{MAX_CLICK_INCREMENT:,}，请核对输入。")
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
-                failure_key = "clicks:" + account.id
-                if self.failures.blocked(failure_key):
-                    raise WuwaError("增加次数连续失败已达到上限，处理后请用 wt恢复 重置计数。")
-                previous_token = account.token
                 _, delta, problem = await self.add_clicks(account, number)
-                if delta <= 0:
-                    await self.failures.fail(
-                        failure_key, "增加游戏点击次数", problem or "回读确认累计点击数未增加", account.id
-                    )
-                else:
-                    await self.failures.success(failure_key)
         await self.flush_notices()
         image = await self.cards.click_summary(account, event, number, delta)
         hint = f"提交提示：{problem}（已回读实际累计值）" if problem else ""
-        hint += self.refresh_hint(previous_token, account)
         return [hint, image] if hint else [image]
 
     def job_id(self, key: str) -> str:
@@ -741,7 +713,10 @@ class Service:
         scheduler.add_job(
             self.tick,
             "date",
-            run_date=datetime.fromtimestamp(max(time.time() + 0.1, task.next_check), timezone.utc),
+            run_date=datetime.fromtimestamp(
+                max(time.time() + 0.1, task.expires_at if task.pause_reason == "auth" else task.next_check),
+                timezone.utc,
+            ),
             args=[task.account_id],
             id=self.job_id(task.account_id),
             name="WuwaTappo 账号宝箱检查",
@@ -778,7 +753,6 @@ class Service:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             binding, account = await self.bound(event)
             async with self.account_lock(account.id):
-                previous_token = account.token
                 task = await Store.task(account.id)
                 now = time.time()
                 if (
@@ -830,7 +804,7 @@ class Service:
                     await Store.save(task)
                     self.schedule(task)
                     action = "已开启 24 小时自动开箱，将立即检查左右宝箱。"
-                answer = action + self.refresh_hint(previous_token, account)
+                answer = action
         await self.flush_notices()
         image = await self.cards.task_summary(account, task, event)
         return [answer, image]
@@ -845,7 +819,7 @@ class Service:
         if pending:
             info: UserInfo | None = None
             account = await Store.account(task.account_id)
-            if account is not None:
+            if account is not None and account.token_state != "expired":
                 try:
                     info = await self.api.me(account.token, fresh=True)
                     if str(info.cuid) != account.cuid:
@@ -889,7 +863,7 @@ class Service:
 
     async def stop(self, event: Event) -> str:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
-            binding, account = await self.bound(event)
+            binding, account = await self.bound(event, allow_expired=True)
             async with self.account_lock(account.id):
                 answer = await self.stop_owned(binding, "已手动停止自动开箱")
         await self.flush_notices()
@@ -897,107 +871,65 @@ class Service:
 
     async def set_paused(self, event: Event, paused: bool) -> str:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
-            if not paused and await Store.binding(identity(event.bot_id, event.user_id)) is None:
-                await self.failures.reset_commands(identity(event.bot_id, event.user_id))
-                return "当前没有绑定账号，命令重试计数已重置，请先绑定账号。"
-            binding, account = await self.bound(event)
+            binding, account = await self.bound(event, allow_expired=paused)
             async with self.account_lock(account.id):
+                account = await Store.account(binding.account_id)
+                if account is None:
+                    raise WuwaError("绑定的账号数据缺失，请重新绑定。")
+                if not paused and account.token_state == "expired":
+                    raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
                 task = await Store.task(account.id)
-                if not paused:
-                    if task is not None and task.status in ("active", "paused") and task.owner_id != binding.id:
-                        raise WuwaError("任务属于另一用户，请由任务所属用户恢复。")
-                    await self.failures.reset_account(account.id)
-                    await Store.reset_notice_attempts(account.id)
-                    if event.user_pm <= 1:
-                        await self.failures.success("maintain")
-                        await self.failures.success("notice_loop")
-                    account.token_renew_after = 0
-                    await Store.save(account)
-                    if task is None or task.status not in ("active", "paused"):
-                        await self.refresh(account)
-                        await self.flush_notices()
-                        return "当前账号的重试计数已重置，将继续核对结果和补发通知；未开启宝箱任务。"
                 if task is None or task.status not in ("active", "paused"):
-                    raise WuwaError("当前没有可暂停或恢复的宝箱任务，请用 wt宝箱 开启。")
+                    action = "暂停" if paused else "恢复"
+                    raise WuwaError(f"当前没有可{action}的任务；请用 wt宝箱 开启新任务。")
                 if task.owner_id != binding.id:
-                    raise WuwaError("任务属于另一用户，请由任务所属用户暂停或恢复。")
+                    raise WuwaError("任务属于另一用户，请由任务所属用户操作。")
                 if task.remaining() <= 0:
                     await self.finish(task, "expired", "本轮已到期")
-                    answer = "本轮已到期，请用 wt宝箱 开启新的 24 小时任务。"
+                    answer = "本轮已到期，请用 wt宝箱 开启新的24小时任务。"
                 elif paused and task.timer_paused:
                     answer = "任务和计时已经暂停。\n" + task_text(task)
                 elif not paused and task.status == "active":
-                    await self.refresh(account)
-                    answer = "任务正在运行，重试计数已重置。\n" + task_text(task)
+                    answer = "任务正在运行。\n" + task_text(task)
                 else:
-                    previous_token = account.token
                     if paused:
                         task.status = "paused"
                         task.pause_reason = "manual"
                         task.paused_at = time.time()
                         action = "宝箱任务和计时已暂停，剩余有效期保留。"
-                        await Store.save(task)
-                        await self.queue_results(account.id, force=True, reason="任务暂停")
                     else:
-                        info = await self.refresh(account)
+                        info = await self.refresh(account, fresh=True)
                         if not await self.reconcile(task, info):
-                            raise WuwaError("仍有结果未确认的开箱，任务保持暂停，请管理员核对流水。")
+                            raise WuwaError("开箱结果仍未确认，任务保持暂停，请稍后恢复。")
                         if task.remaining() <= 0:
                             await self.finish(task, "expired", "本轮已到期")
-                            await self.flush_notices()
-                            return "本轮已到期，请用 wt宝箱 开启新一轮。"
-                        now = time.time()
+                            return "本轮已到期，请用 wt宝箱 开启新任务。"
                         if task.paused_at is not None:
-                            task.expires_at += now - task.paused_at
+                            task.expires_at += time.time() - task.paused_at
                         task.paused_at = None
                         task.status = "active"
                         task.pause_reason = ""
                         task.failures = 0
-                        action = "宝箱任务已恢复，继续剩余有效期，将立即检查左右宝箱。"
+                        await self.failures.reset_account(account.id)
+                        await Store.reset_notice_attempts(account.id)
+                        action = "宝箱任务已恢复，继续剩余有效期。"
                     task.next_check = time.time()
                     await Store.save(
                         task,
                         Notice(
                             subscription_id=task.subscription_id,
-                            account_id=task.account_id,
+                            account_id=account.id,
                             text=action + "\n" + task_text(task),
                         ),
                     )
-                    self.schedule(task)
-                    answer = action + "\n" + task_text(task) + self.refresh_hint(previous_token, account)
+                    if paused:
+                        self.unschedule(account.id)
+                        await self.queue_results(account.id, force=True, reason="任务暂停")
+                    else:
+                        self.schedule(task)
+                    answer = action + "\n" + task_text(task)
         await self.flush_notices()
         return answer
-
-    async def pause_after_auth_failure(self, event: Event) -> None:
-        async with self.user_lock(identity(event.bot_id, event.user_id)):
-            binding = await Store.binding(identity(event.bot_id, event.user_id))
-            if binding is None:
-                return
-            async with self.account_lock(binding.account_id):
-                task = await Store.task(binding.account_id)
-                if task is None or task.status != "active":
-                    return
-                task.status = "paused"
-                task.pause_reason = "auth"
-                await self.failures.fail(
-                    "auth:" + binding.account_id,
-                    "账号鉴权未恢复",
-                    "账号查询仍未通过，宝箱任务已暂停。",
-                    binding.account_id,
-                    limit=1,
-                )
-                await self.queue_results(binding.account_id, force=True, reason="重新登录失败")
-                task.next_check = self.next_wakeup(task, None)
-                await Store.save(
-                    task,
-                    Notice(
-                        subscription_id=task.subscription_id,
-                        account_id=task.account_id,
-                        text="登录态失效且重新登录未成功，自动开箱已暂停。处理后可用 wt恢复 继续本轮。",
-                    ),
-                )
-                self.schedule(task)
-        await self.flush_notices()
 
     async def record_success(self, task: ChestTask, record: ChestRecord) -> None:
         record.state = "success"
@@ -1104,11 +1036,8 @@ class Service:
                     raise WuwaError(supplement + "本次未重试开箱。")
                 if error.is_auth:
                     # 先验证原会话，本次不再次提交开箱。
-                    previous_token = account.token
                     await self.refresh(account, fresh=True)
-                    if account.token == previous_token:
-                        raise WuwaError("开箱请求被拒绝，但原 token 仍可查询；会话已保留，本次停止开箱。") from None
-                    raise NetworkError("开箱请求鉴权失败，账号查询确认后已恢复会话，稍后重新检查。") from None
+                    raise WuwaError("开箱请求被拒绝，但token仍可查询；本次停止开箱。") from None
                 if supplement:
                     await self.account_notice(account, f"{SIDE_NAMES[side]}宝箱重试未成功：{error}。\n{supplement}")
                 raise
@@ -1143,8 +1072,6 @@ class Service:
             failure = await self.failures.fail("check:" + key, "账号检查", self.error_detail(error), key)
             if failure.blocked:
                 self.unschedule(key)
-        finally:
-            await self.failures.flush_alerts()
 
     async def _check_account(self, key: str) -> None:
         async with self.account_lock(key):
@@ -1162,6 +1089,8 @@ class Service:
             try:
                 if task.remaining() <= 0:
                     await self.finish(task, "expired", "24 小时自动开箱已结束")
+                    return
+                if task.status == "paused" and task.pause_reason == "auth":
                     return
                 if not task.reminded and task.expires_at - time.time() <= RENEW_WINDOW:
                     task.reminded = True
@@ -1212,26 +1141,31 @@ class Service:
                 await self.task_failure(task, error)
                 retry = True
                 interrupted = True
-            except AuthenticationError as error:
+            except AuthenticationError:
                 interrupted = True
                 task.status = "paused"
                 task.pause_reason = "auth"
-                await self.failures.fail("auth:" + key, "账号鉴权未恢复", str(error), key, limit=1)
-                await Store.save(
-                    task,
-                    Notice(subscription_id=task.subscription_id, account_id=key, text=f"{error} 自动开箱已暂停。"),
-                )
+                await Store.save(task)
+                self.unschedule(key)
             except ApiError as error:
                 interrupted = True
                 if error.is_auth:
-                    task.status = "paused"
-                    task.pause_reason = "auth"
-                    text = f"请求鉴权未通过：{error}。自动开箱已暂停，请查询账号或添加有效 token 后发送 wt恢复。"
-                    await self.failures.fail("auth:" + key, "账号鉴权未恢复", error.details, key, limit=1)
-                    await Store.save(task, Notice(subscription_id=task.subscription_id, account_id=key, text=text))
+                    account = await Store.account(key)
+                    if account is not None:
+                        try:
+                            await self.refresh(account, fresh=True)
+                        except AuthenticationError:
+                            task.status = "paused"
+                            task.pause_reason = "auth"
+                            await Store.save(task)
+                            self.unschedule(key)
+                        else:
+                            # 业务请求拒绝但账号仍可查询，不标记token过期。
+                            await self.task_failure(task, error)
+                            retry = True
                 else:
                     await self.task_failure(task, error)
-                retry = True
+                    retry = True
             except WuwaError as error:
                 interrupted = True
                 await self.task_failure(task, error)
@@ -1273,6 +1207,14 @@ class Service:
                 # 启动后命令已可能进入，锁内重读，避免覆盖用户刚完成的续期/暂停。
                 task = await Store.task(snapshot.account_id)
                 if task is not None and task.status in ("active", "paused"):
+                    account = await Store.account(task.account_id)
+                    if account is not None and account.token_state == "expired":
+                        if task.status == "active":
+                            task.status = "paused"
+                            task.pause_reason = "auth"
+                            await Store.save(task)
+                        self.schedule(task)
+                        continue
                     if self.failures.blocked("check:" + task.account_id) or self.failures.blocked(
                         "save:" + task.account_id
                     ):
@@ -1294,6 +1236,7 @@ class Service:
         if not self.failures.allows("maintain"):
             return
         try:
+            await Store.prepare_login_sessions()
             await self._maintain()
             await self.failures.success("maintain")
         except SQLAlchemyError as error:
@@ -1302,8 +1245,6 @@ class Service:
             if self.failures.attempts("maintain") == 0:
                 logger.exception("[WuwaTappoUID] 后台巡检出现意外错误")
             await self.failures.fail("maintain", "后台巡检", self.error_detail(error))
-        finally:
-            await self.failures.flush_alerts()
 
     async def _maintain(self) -> None:
         if not self.closing:
@@ -1328,7 +1269,7 @@ class Service:
                     if task is None or task.status in ("active", "paused"):
                         continue
                     account = await Store.account(key)
-                    if account is None:
+                    if account is None or account.token_state == "expired":
                         continue
                     try:
                         # 结束后只查询原登录态，不重新登录、不提交点击或开箱。
@@ -1367,9 +1308,9 @@ class Service:
 
     def release_notice_image(self, key: str) -> None:
         if key in self._notice_images:
-            self._notice_image_bytes -= len(self._notice_images.pop(key).body)
+            self._notice_image_bytes -= sum(map(len, self._notice_images.pop(key).body))
 
-    def cached_notice_image(self, key: str) -> bytes | None:
+    def cached_notice_image(self, key: str) -> tuple[bytes, ...] | None:
         if key not in self._notice_images:
             return None
         cached = self._notice_images[key]
@@ -1379,14 +1320,14 @@ class Service:
         self._notice_images.move_to_end(key)
         return cached.body
 
-    def cache_notice_image(self, key: str, revision: int, body: bytes) -> None:
+    def cache_notice_image(self, key: str, revision: int, body: tuple[bytes, ...]) -> None:
         self.release_notice_image(key)
-        size = len(body)
+        size = sum(map(len, body))
         if size > NOTICE_CACHE_BYTES:
             return
         while self._notice_images and self._notice_image_bytes + size > NOTICE_CACHE_BYTES:
             _, old = self._notice_images.popitem(last=False)
-            self._notice_image_bytes -= len(old.body)
+            self._notice_image_bytes -= sum(map(len, old.body))
         self._notice_images[key] = CachedNoticeImage(revision, body)
         self._notice_image_bytes += size
 
@@ -1405,7 +1346,7 @@ class Service:
                 records = await Store.records(json.loads(notice.record_ids))
                 rendered = await self.cards.results(records, notice.available_clicks, notice_text, contexts[account.id])
                 self.cache_notice_image(notice.id, revision, rendered)
-            return [MessageSegment.image(rendered)]
+            return [MessageSegment.image(page) for page in rendered]
         label = f"CUID {mask_cuid(account.cuid)}：\n" if account is not None else ""
         messages = [MessageSegment.text(label + notice_text + "\n")]
         if notice.asset_id:
@@ -1433,8 +1374,6 @@ class Service:
             if self.failures.attempts("notice_loop") == 0:
                 logger.exception("[WuwaTappoUID] 通知巡检出现意外错误")
             await self.failures.fail("notice_loop", "通知巡检", self.error_detail(error))
-        finally:
-            await self.failures.flush_alerts()
 
     async def _flush_notices(self) -> None:
         async with self._push_lock:
@@ -1449,15 +1388,6 @@ class Service:
                 send_key = f"notice:{account_id}:{subscription_id}"
                 render_key = f"render:{account_id}:{subscription_id}"
                 if not self.failures.allows(send_key):
-                    continue
-                if max(notice.attempts for notice in batch) >= retry_limit():
-                    await self.failures.fail(
-                        send_key,
-                        "结果通知发送",
-                        "保存的发送尝试次数已达到上限，通知保留；wt恢复 可重置。",
-                        account_id,
-                        limit=1,
-                    )
                     continue
                 sub = await Store.subscription(subscription_id)
                 if sub is None or not sub.WS_BOT_ID:

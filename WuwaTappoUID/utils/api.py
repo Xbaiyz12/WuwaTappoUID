@@ -4,7 +4,6 @@ import asyncio
 import hashlib
 import json
 import time
-import uuid
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -31,6 +30,7 @@ from .schema import (
     OpenResult,
     RoleInfo,
     RoleQuery,
+    SdkLogin,
     Side,
     SynthesisResult,
     UserInfo,
@@ -246,22 +246,26 @@ class WuwaAPI:
             raise
         return response.payload()
 
-    async def login(self, cuid: str, domestic: int, player_id: int | str = 0, server_id: str = "0") -> LoginData:
-        """字段形状对齐官方客户端；accessToken 一次性随机生成，插件不持有任何真实凭据。"""
+    async def exchange_sdk_token(self, login: SdkLogin, role: RoleInfo, channel_id: int | str) -> LoginData:
+        """仅显式网页登录使用真实 KrSDK 凭据；认证请求不自动重发。"""
         payload = {
-            "cuid": cuid,
-            "puid": cuid,
-            "channelId": 18,
-            "userid": cuid,
-            "cname": f"U{cuid}A",
-            "accessToken": str(uuid.uuid4()),
+            "cuid": login.cuid,
+            "puid": login.sdk_openid,
+            "channelId": channel_id,
+            "userid": login.sdk_openid,
+            "cname": login.username,
+            "accessToken": login.token,
             "source": "sdk",
-            "playerId": player_id,
-            "serverId": server_id,
-            "is_domestic": domestic,
+            "playerId": int(role.playerId),
+            "serverId": role.serverId,
+            "is_domestic": 1,
         }
         result = parse(LoginData, await self.request("/api/auth/login", payload=payload, retry=False))
         return result
+
+    async def login_roles(self, cuid: str) -> RoleQuery:
+        data = await self.request("/api/auth/player/query", payload={"cuid": cuid, "is_domestic": 1})
+        return parse(RoleQuery, data)
 
     async def renew_token(self, token: str) -> None:
         # 续期延长服务端期限，超时不盲目重复；仍保留原 token。
@@ -293,21 +297,21 @@ class WuwaAPI:
 
     async def bags(self, token: str, *, fresh: bool = False) -> list[Item]:
         cache = _read_cache.get()
-        key = self._read_key(token)
-        if not fresh and cache is not None and cache.active and key in cache.bags:
-            return cache.bags[key]
+        cache_key = self._read_key(token)
+        if not fresh and cache is not None and cache.active and cache_key in cache.bags:
+            return cache.bags[cache_key]
         data = await self.request("/api/frontend/bags/list", payload={}, token=token)
         if isinstance(data, dict):
-            for key in ("list", "items", "appearances"):
-                if key in data and isinstance(data[key], list):
-                    data = data[key]
+            for field_name in ("list", "items", "appearances"):
+                if field_name in data and isinstance(data[field_name], list):
+                    data = data[field_name]
                     break
         try:
             items = ITEMS.validate_python(data)
         except ValidationError:
             raise DataError("背包响应格式已变化，无法将其当作空背包。") from None
-        if cache is not None and cache.active and key == self._read_key(token):
-            cache.bags[key] = items
+        if cache is not None and cache.active and cache_key == self._read_key(token):
+            cache.bags[cache_key] = items
         return items
 
     async def atlas(self) -> list[Item]:

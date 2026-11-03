@@ -185,7 +185,7 @@ def render_account(
         icon = fit(picture.crop(picture.getbbox()), s(76), s(76))
         canvas.alpha_composite(icon, (s(60) + (s(76) - icon.width) // 2, s(231) + (s(76) - icon.height) // 2))
     else:
-        text(draw, 98, 256, "未设置", 13, SOFT, align="center")
+        text(draw, 98, 256, "头像暂不可用" if info.character is not None else "未设置", 13, SOFT, align="center")
     if roles:
         role = roles[0]
         name_right = text(

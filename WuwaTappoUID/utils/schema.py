@@ -13,9 +13,11 @@ CODE_TOKEN_INVALID = (10002, 10003, 90002)
 TOKEN_LIFETIME = 7 * 24 * 3600
 TOKEN_RENEW_WINDOW = 2 * 24 * 3600
 TOKEN_RENEW_RETRY = 5 * 60
+TOKEN_EXPIRED_MESSAGE = "token已过期，请发送 wt登录，或使用 wt添加token TOKEN 更新。"
 TASK_SECONDS = 24 * 3600
 RENEW_WINDOW = 60 * 60
 AUTO_CLICKS = 10_000
+MAX_CLICK_INCREMENT = 1_000_000
 # 请求发出这么久后该侧冷却仍未推进，就判定那次开箱没有生效（HTTP 超时为 25 秒）。
 SETTLE_SECONDS = 120
 ASSET_MANIFEST_PATH = "/app/asset-json/appearance_asset.json"
@@ -37,6 +39,7 @@ class ApiError(WuwaError):
             10002: "登录鉴权被拒绝（10002）",
             10003: "登录鉴权被拒绝（10003）",
             90002: "账号已在其他设备登录（90002）",
+            10024: "库洛登录凭据校验失败，请重新发送 wt登录（10024）",
             10014: "服务端正在处理另一项操作（10014）",
             70004: "当前没有可用宝箱（70004）",
             70005: "点击不足（70005）",
@@ -77,7 +80,7 @@ class DatabaseSchemaError(WuwaError):
 
 
 class AuthenticationError(WuwaError):
-    """登录态未确认，停止写操作；已取得的新 token 不回退或重复登录。"""
+    """登录态失效或尚未验证，停止当前操作。"""
 
 
 class Expired(Exception):
@@ -99,6 +102,13 @@ class Envelope(BaseModel):
 class LoginData(BaseModel):
     token: str = Field(min_length=1, repr=False)
     expire_time: int | float | str | None = None
+
+
+class SdkLogin(BaseModel):
+    token: str = Field(min_length=1, max_length=4096, repr=False)
+    cuid: str = Field(pattern=r"^[0-9]{6,16}$")
+    sdk_openid: str = Field(min_length=1, max_length=128)
+    username: str = Field(min_length=1, max_length=128)
 
 
 def token_expiry(value: int | float | str | None) -> float:
@@ -187,6 +197,7 @@ class RoleInfo(BaseModel):
 
 class RoleQuery(BaseModel):
     items: list[RoleInfo] = []
+    channelId: int | str | None = None
 
 
 # 鸣潮服务器编号，取自 XutheringWavesUID 的 SERVER_ID / NET_SERVER_ID_MAP。
@@ -225,6 +236,9 @@ class AssetManifest(BaseModel):
             for group in (self.character_skin, self.accessory, self.emote)
             for asset_id, entry in group.items()
         }
+
+    def head_images(self) -> dict[str, str]:
+        return {asset_id: entry.head1.url for asset_id, entry in self.character_skin.items() if entry.head1 is not None}
 
     def lookup(self, asset_id: str) -> str:
         for group in (self.character_skin, self.accessory, self.emote):

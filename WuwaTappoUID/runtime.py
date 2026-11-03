@@ -13,8 +13,10 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from .utils.api import WuwaAPI, with_read_cache
 from .utils.database import Account, AccountLink, Binding, Store, ensure_database_schema
+from .utils.failures import ALERT_JOB
+from .utils.login import LoginManager
 from .utils.resources import Resources
-from .utils.schema import DatabaseSchemaError, DataError, SessionImport, token_expiry
+from .utils.schema import DatabaseSchemaError, DataError, SessionImport, WuwaError, token_expiry
 from .utils.service import Service, account_id, identity
 from .utils.settings import retry_limit
 
@@ -22,9 +24,10 @@ ROOT = get_res_path("WuwaTappoUID")
 api = WuwaAPI()
 resources = Resources(api, ROOT)
 service = Service(api, resources)
+login = LoginManager(service)
 NOTICE_JOB = "WuwaTappoUID:notice"
 RESOURCE_JOB = "WuwaTappoUID:resources"
-ALERT_JOB = "WuwaTappoUID:alerts"
+LOGIN_JOB = "WuwaTappoUID:login"
 _initialize_lock = asyncio.Lock()
 _initialize_attempted = False
 
@@ -80,11 +83,11 @@ async def wt_initialize() -> None:
         _initialize_attempted = True
         try:
             await service.failures.load()
-            logger.info(f"[WuwaTappoUID] 已加载持久化重试状态，连续失败上限 {retry_limit()} 次。")
+            logger.info(f"[WuwaTappoUID] 已加载待发送告警，后台连续异常上限 {retry_limit()} 次（本次运行计数）。")
             await ensure_database_schema()
+            await Store.prepare_login_sessions(startup=True)
             await api.start()
             await resources.load()
-            await import_sessions()
         except (SQLAlchemyError, DatabaseSchemaError) as error:
             await service.disable_database(error)
             return
@@ -97,10 +100,18 @@ async def wt_initialize() -> None:
         service.database_error = ""
         await service.failures.success("database")
         await service.failures.success("initialize")
+        try:
+            await import_sessions()
+        except SQLAlchemyError as error:
+            await service.disable_database(error)
+        except (WuwaError, OSError) as error:
+            detail = service.error_detail(error)
+            logger.error(f"[WuwaTappoUID] 登录态导入失败，文件已保留，已有账号与任务继续运行：{detail}")
+            await service.failures.fail("import", "登录态导入", detail, limit=1)
 
 
 async def wt_update_resources() -> None:
-    # 整轮失败计数持久化；重启也不会重新获得自动更新预算。
+    # 连续异常计数仅在本次运行中使用，待发送告警单独落盘。
     for _ in range(retry_limit()):
         if service.failures.blocked("resources"):
             return
@@ -121,7 +132,6 @@ async def wt_update_resources() -> None:
                 await service.failures.success("resources")
                 return
             await service.failures.fail("resources", "资源更新", result)
-        await service.failures.flush_alerts()
         if service.closing:
             return
 
@@ -158,6 +168,16 @@ async def wt_start() -> None:
         replace_existing=True,
     )
     scheduler.add_job(
+        login.poll_external,
+        "interval",
+        seconds=3,
+        id=LOGIN_JOB,
+        name="WuwaTappo 外置登录结果",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
         wt_update_resources,
         "date",
         id=RESOURCE_JOB,
@@ -170,7 +190,7 @@ async def wt_start() -> None:
 @gss.on_bot_connect
 @with_read_cache
 async def wt_bot_connected() -> None:
-    await service.failures.flush_alerts()
+    service.failures.wake_alerts()
     await service.flush_notices()
 
 

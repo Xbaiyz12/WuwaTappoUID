@@ -51,6 +51,27 @@ class AccountLink(SQLModel, table=True):
     account_id: str = Field(primary_key=True, max_length=64)
 
 
+class LoginSession(SQLModel, table=True):
+    __tablename__ = "wt_login_session"
+    __table_args__ = {"extend_existing": True}
+    id: str = Field(primary_key=True, max_length=64)
+    owner_id: str = Field(index=True, max_length=64)
+    platform: str = Field(max_length=64)
+    user_id: str = Field(max_length=128)
+    subscription_id: int
+    expires_at: float
+    status: str = Field(default="pending", max_length=16)
+    account_id: str = Field(default="", max_length=64)
+    token_digest: str = Field(default="", max_length=64, repr=False)
+    message: str = Field(default="", sa_column=Column(Text, nullable=False))
+    result: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+
+    external_url: str = Field(default="", sa_column=Column(Text, nullable=False))
+    external_state: str = Field(default="", max_length=128, repr=False)
+    external_poll_token: str = Field(default="", max_length=128, repr=False)
+    external_synced: bool = False
+
+
 class ChestTask(SQLModel, table=True):
     __tablename__ = "wt_chest_task"
     __table_args__ = {"extend_existing": True}
@@ -134,6 +155,12 @@ class SynthesisRecord(SQLModel, table=True):
 
 # 按 GS 官方流程注册补列；旧数据使用默认值，不要求回填历史账号关联。
 ADDED_COLUMNS = {
+    "wt_login_session": {
+        "external_url": "TEXT NOT NULL DEFAULT ''",
+        "external_state": "VARCHAR(128) NOT NULL DEFAULT ''",
+        "external_poll_token": "VARCHAR(128) NOT NULL DEFAULT ''",
+        "external_synced": "BOOLEAN NOT NULL DEFAULT FALSE",
+    },
     "wt_account": {
         "subscribed": "BOOLEAN NOT NULL DEFAULT FALSE",
         "token_expires_at": "FLOAT NOT NULL DEFAULT 0",
@@ -159,6 +186,7 @@ PLUGIN_TABLE_NAMES = (
     "wt_account",
     "wt_binding",
     "wt_account_link",
+    "wt_login_session",
     "wt_chest_task",
     "wt_chest_record",
     "wt_notice",
@@ -200,6 +228,63 @@ async def ensure_database_schema() -> None:
 
 class Store:
     @classmethod
+    @with_read_session
+    async def login_session(cls, session: AsyncSession, key: str) -> LoginSession | None:
+        return await session.get(LoginSession, key)
+
+    @classmethod
+    @with_read_session
+    async def open_logins(cls, session: AsyncSession, owner_id: str | None = None) -> list[LoginSession]:
+        query = select(LoginSession).where(col(LoginSession.status).in_(["pending", "processing", "verifying"]))
+        if owner_id is not None:
+            query = query.where(col(LoginSession.owner_id) == owner_id)
+        return list((await session.execute(query)).scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def external_logins(cls, session: AsyncSession) -> list[LoginSession]:
+        query = select(LoginSession).where(
+            col(LoginSession.external_url) != "", col(LoginSession.external_synced).is_(False)
+        )
+        return list((await session.execute(query)).scalars().all())
+
+    @classmethod
+    @with_session
+    async def prepare_login_sessions(cls, session: AsyncSession, *, startup: bool = False) -> None:
+        now = time.time()
+        rows = (await session.execute(select(LoginSession))).scalars().all()
+        for row in rows:
+            if row.expires_at < now - 24 * 3600:
+                pending = await session.scalar(
+                    select(func.count())
+                    .select_from(Notice)
+                    .where(col(Notice.subscription_id) == row.subscription_id, col(Notice.submitted).is_(False))
+                )
+                if pending:
+                    continue
+                subscription = await session.get(Subscribe, row.subscription_id)
+                if subscription is not None and subscription.task_name == "WuwaTappo登录":
+                    await session.delete(subscription)
+                await session.delete(row)
+            elif row.expires_at <= now and row.status in ("pending", "verifying"):
+                row.status = "expired"
+                row.message = "登录链接已过期，请重新发送 wt登录。"
+                session.add(row)
+            elif startup and row.status == "processing":
+                row.status = "failed"
+                row.message = "登录处理已中断，请重新发送 wt登录。"
+                session.add(row)
+        if startup:
+            accounts = (
+                (await session.execute(select(Account).where(col(Account.token_state) == "login_unconfirmed")))
+                .scalars()
+                .all()
+            )
+            for account in accounts:
+                account.token_state = "pending" if account.token else "expired"
+                session.add(account)
+
+    @classmethod
     @with_session
     async def reset_notice_attempts(cls, session: AsyncSession, account_id: str) -> None:
         result = await session.execute(
@@ -235,6 +320,19 @@ class Store:
                 await session.delete(binding)
             else:
                 binding.account_id = replacement
+        await session.flush()
+        links = await session.scalar(
+            select(func.count()).select_from(AccountLink).where(col(AccountLink.account_id) == account_id)
+        )
+        current_bindings = await session.scalar(
+            select(func.count()).select_from(Binding).where(col(Binding.account_id) == account_id)
+        )
+        if not links and not current_bindings:
+            account = await session.get(Account, account_id)
+            if account is not None:
+                account.token = ""
+                account.token_state = "expired"
+                account.token_expires_at = account.token_renew_after = 0
 
     @classmethod
     @with_read_session
@@ -263,8 +361,15 @@ class Store:
         return list(result.scalars().all())
 
     @classmethod
-    @with_read_session
+    @with_session
     async def linked_accounts(cls, session: AsyncSession, owner_id: str) -> list[Account]:
+        # 旧版本只保存当前绑定；补齐这一条现有关系，不回填已删除账号或历史任务。
+        binding = await session.get(Binding, owner_id)
+        if binding is not None and await session.get(Account, binding.account_id) is not None:
+            current_link = await session.get(AccountLink, (owner_id, binding.account_id))
+            if current_link is None:
+                session.add(AccountLink(owner_id=owner_id, account_id=binding.account_id))
+                await session.flush()
         result = await session.execute(
             select(Account)
             .join(AccountLink, col(AccountLink.account_id) == col(Account.id))

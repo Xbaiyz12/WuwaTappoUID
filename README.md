@@ -16,26 +16,26 @@ git clone https://github.com/gufei233/WuwaTappoUID.git gsuid_core/plugins/WuwaTa
 
 | 命令 | 功能 |
 | --- | --- |
-| `wt绑定 CUID` / `wt绑定 CUID 海外` | 绑定账号 |
-| `wt添加token TOKEN` | 使用已有 token 绑定账号 |
+| `wt登录` | 浏览器登录国服，链接5分钟内有效 |
+| `wt添加token TOKEN` | 仅私聊，使用已有 token 绑定账号 |
 | `wt查看` / `wt切换 [1]` / `wt删除 [1]` | 多账号管理 |
 | `wt信息` / `wt次数` | 查看账号、冷却、任务和点击数 |
 | `wt背包 [角色/配件/表情]` / `wt图鉴 [角色/配件/表情]` | 不带参数查看全部，带参数只查看对应分类 |
 | `wt宝箱` | 开启24小时任务；剩余不超过1小时可续期24小时，并提醒一次 |
 | `wt暂停` / `wt恢复` / `wt停止` | 管理任务，暂停时冻结计时 |
 | `wt订阅` / `wt取消订阅` | 成功开箱10次后通知 / 任务结束汇总 |
-| `wt增加次数 N` | 增加游戏点击数 |
+| `wt增加次数 N` | 增加游戏点击数，单次1～1,000,000 |
 | `wt合成` / `wt合成 同阶` | 合成多余物品，每种留1件，默认升阶 |
 | `wt更新资源` | 更新名称与素材 |
 | `wt帮助` | 查看全部命令与说明 |
 
-CUID 是库洛账号标识，不是鸣潮角色 UID。请仅绑定本人或已获授权的账号，token 建议通过私聊发送。任务和通知会在重启后恢复。
+主人在插件配置中填写 `login_public_url`（HTTPS域名）。默认使用 GsCore 登录页；关闭 `login_use_local` 后使用 [ww-login](https://github.com/gufei233/ww-login) 外置登录，GsCore 无需公网入口。配置方式见管理说明。CUID仅用于账号标识，不再支持凭CUID登录。请仅绑定本人或已获授权的账号，token 仅通过私聊添加。本地登录页会显示脱敏的绑定对象，请确认是本人账号。token过期暂停的有效任务在登录或添加token后自动恢复；已到期任务自动收尾汇总，手动暂停仍需 `wt恢复`。任务和通知会在重启后恢复。开箱汇总每页最多40件，多页合并转发。
 
 [帮助示例](docs/help.png) · [管理说明](docs/ADMIN.md) · [合成说明](docs/SYNTHESIS.md) · [更新记录](CHANGELOG.md)
 
 ## 致谢
 
-感谢 [XWUIDCollection](https://github.com/Loping151/XWUIDCollection) 提供图片布局和素材参考。素材来源详见 [素材说明](WuwaTappoUID/assets/tappo/ATTRIBUTION.md)。
+登录交互参考 [XutheringWavesUID](https://github.com/Loping151/XutheringWavesUID)。感谢 [XWUIDCollection](https://github.com/Loping151/XWUIDCollection) 提供图片布局和素材参考。素材来源详见 [素材说明](WuwaTappoUID/assets/tappo/ATTRIBUTION.md)。
 
 ## 免责声明
 

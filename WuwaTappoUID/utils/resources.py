@@ -11,7 +11,16 @@ from pydantic import BaseModel, ValidationError
 
 from .api import JSON, Download, WuwaAPI, parse
 from .item_image import render_tile
-from .schema import ASSET_MANIFEST_PATH, AssetManifest, DataError, DesktopCharacter, Dictionary, Item, WuwaError
+from .schema import (
+    ASSET_MANIFEST_PATH,
+    AssetEntry,
+    AssetManifest,
+    DataError,
+    DesktopCharacter,
+    Dictionary,
+    Item,
+    WuwaError,
+)
 from .settings import retry_limit
 
 DEFAULT_HOST = "https://mc-wuwatappo.kurogames-global.com"
@@ -227,7 +236,8 @@ class Resources:
 
     async def _sync_images(self, force: bool) -> tuple[int, int, int, int]:
         assert self.manifest is not None
-        urls = sorted({self._image_url(relative) for relative in self.manifest.images().values()})
+        images = (*self.manifest.images().values(), *self.manifest.head_images().values())
+        urls = sorted({self._image_url(relative) for relative in images})
         semaphore = asyncio.Semaphore(4)
         consecutive_failures = 0
 
@@ -281,27 +291,48 @@ class Resources:
         temp.write_bytes(data)
         temp.replace(path)
 
-    async def character_head(self, character: DesktopCharacter) -> bytes:
-        """当前桌宠的 head1 图层；按资源 URL 与版本缓存，不固定角色。"""
+    def _character_entry(self, character: DesktopCharacter) -> AssetEntry:
         manifest = self.manifest
         if manifest is None:
             raise DataError("桌宠头像资源清单尚未加载，请发送 wt更新资源 后重试。")
         key = str(character.id)
         if key not in manifest.character_skin and key in manifest.character_skin_atlas:
             key = str(manifest.character_skin_atlas[key].height_light_id)
-        if key not in manifest.character_skin:
+        entry = manifest.character_skin.get(key)
+        if entry is None and self.catalog is not None and character.name:
+            name = character.name.removesuffix(".png")
+            item = next(
+                (
+                    item
+                    for item in self.catalog.items
+                    if item.asset_type == "character_skin"
+                    and item.asset_name is not None
+                    and item.asset_name.removesuffix(".png") == name
+                ),
+                None,
+            )
+            if item is not None:
+                entry = manifest.character_skin.get(str(item.asset_id))
+        if entry is None:
             raise DataError("当前桌宠角色未出现在资源清单中，请发送 wt更新资源 后重试。")
-        head = manifest.character_skin[key].head1
-        if head is None:
-            raise DataError("当前桌宠角色缺少头像素材，请发送 wt更新资源 后重试。")
-        url = self._image_url(head.url)
-        path = self._raw_path(url)
-        async with self._image_locks.setdefault(url, asyncio.Lock()):
+        return entry
+
+    async def character_head(self, character: DesktopCharacter) -> bytes:
+        """只读本地头像；缺少 head1 时复用按 ID 或素材文件名匹配的本地主图。"""
+        entry = self._character_entry(character)
+        images = ([entry.head1.url] if entry.head1 is not None else []) + [entry.url]
+        for relative in images:
+            path = self._raw_path(self._image_url(relative))
             if path.exists():
-                return await asyncio.to_thread(path.read_bytes)
-            raw = await self.api.fetch_bytes(url)
-            await asyncio.to_thread(self._write_file, path, raw)
-            return raw
+                raw = await asyncio.to_thread(path.read_bytes)
+                try:
+                    await asyncio.to_thread(self._verify_image, raw)
+                except DataError:
+                    await asyncio.to_thread(path.unlink)
+                    logger.warning("[WuwaTappoUID] 本地头像缓存损坏，资源更新时重新下载。")
+                else:
+                    return raw
+        raise DataError("本地角色图片尚未缓存，请发送 wt更新资源 补齐。")
 
     async def item_image(self, asset_id: str | int, rarity: str) -> bytes | None:
         """只读本地原图，推送过程不等待网络下载。"""

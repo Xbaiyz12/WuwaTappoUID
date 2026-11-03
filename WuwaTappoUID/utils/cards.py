@@ -18,9 +18,10 @@ from .database import Account, ChestRecord, ChestTask, Store
 from .formatting import mask_cuid
 from .reply_card import TaskSnapshot, render_account, render_clicks, render_task
 from .resources import Resources
-from .schema import Item, OpenResult, RoleInfo, SynthesisResult, UserInfo, WuwaError
+from .schema import ApiError, Item, NetworkError, OpenResult, RoleInfo, SynthesisResult, UserInfo, WuwaError
 
 KINDS = {"character": "角色", "accessory": "配件", "emote": "表情"}
+RESULT_PAGE_SIZE = 40
 CATALOG_PATH = Path(__file__).parent.parent / "assets" / "tappo" / "catalog.json"
 
 
@@ -170,7 +171,7 @@ class Cards:
                     logger.warning(f"[WuwaTappoUID] 聊天头像暂不可用：{type(error).__name__}")
         info = UserInfo.model_validate_json(account.info) if account.info else None
         uid = str(info.player_id) if info and info.player_id else ""
-        if uid in ("", "0"):
+        if uid in ("", "0") and account.token_state != "expired":
             cached_uid = self._uids.get(account.id)
             if cached_uid is not None and cached_uid[0] > time.time():
                 uid = cached_uid[1]
@@ -211,6 +212,22 @@ class Cards:
             subscribed,
         )
 
+    async def desktop_avatar(self, account: Account, info: UserInfo) -> bytes | None:
+        if info.character is None:
+            return None
+        try:
+            raw = await self.resources.character_head(info.character)
+        except (WuwaError, OSError) as error:
+            if isinstance(error, (ApiError, NetworkError)):
+                detail = error.details
+            elif isinstance(error, WuwaError):
+                detail = str(error)
+            else:
+                detail = type(error).__name__
+            logger.warning(f"[WuwaTappoUID] 桌宠头像暂不可用，使用占位：{detail}。")
+            return None
+        return raw
+
     async def account_summary(
         self,
         account: Account,
@@ -222,7 +239,7 @@ class Cards:
         info = UserInfo.model_validate_json(account.info)
         snapshot = self.task_snapshot(task, account.subscribed) if task is not None else None
         profile = await self.header(account, None, event)
-        desktop_avatar = await self.resources.character_head(info.character) if info.character is not None else None
+        desktop_avatar = await self.desktop_avatar(account, info)
         async with self._draw_lock:
             return await asyncio.to_thread(
                 render_account,
@@ -263,6 +280,8 @@ class Cards:
 
     async def result_context(self, account: Account, event: Event) -> ResultContext:
         progress = None
+        if account.token_state == "expired":
+            return ResultContext(await self.header(account, None, event), progress)
         try:
             async with asyncio.timeout(12):
                 progress = self.progress(await self.api.bags(account.token))
@@ -271,6 +290,18 @@ class Cards:
         return ResultContext(await self.header(account, None, event), progress)
 
     async def results(
+        self, records: list[ChestRecord], available: int | None, note: str, context: ResultContext
+    ) -> tuple[bytes, ...]:
+        pages = (len(records) + RESULT_PAGE_SIZE - 1) // RESULT_PAGE_SIZE
+        images = []
+        for offset in range(0, len(records), RESULT_PAGE_SIZE):
+            page_note = f"{note} · 第 {offset // RESULT_PAGE_SIZE + 1}/{pages} 页" if pages > 1 else note
+            images.append(
+                await self.result_page(records[offset : offset + RESULT_PAGE_SIZE], available, page_note, context)
+            )
+        return tuple(images)
+
+    async def result_page(
         self, records: list[ChestRecord], available: int | None, note: str, context: ResultContext
     ) -> bytes:
         results = [OpenResult.model_validate_json(record.result) for record in records if record.result]
