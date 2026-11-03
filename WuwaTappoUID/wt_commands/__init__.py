@@ -1,6 +1,7 @@
 """wt 命令；显式请求才执行，不注册 AI 工具。"""
 
 import asyncio
+import hashlib
 import re
 
 from gsuid_core.bot import Bot
@@ -16,7 +17,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..runtime import resources, service
 from ..utils.help_card import help_text, render
-from ..utils.schema import AuthenticationError, WuwaError
+from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
+from ..utils.service import identity
 
 sv = SV("WuwaTappo账号与宝箱", pm=6)
 register_help("WuwaTappoUID", f"{get_plugin_available_prefix('WuwaTappoUID')}帮助")
@@ -61,11 +63,18 @@ async def wt_command(bot: Bot, event: Event) -> None:
     # GS 会把命令本身放在 command，把剥离命令后的参数放在 text。
     command = event.command.removeprefix("wt").strip()
     argument = event.text.strip()
+    failure_key = f"command:{identity(event.bot_id, event.user_id)}:{command}"
+    if command in ("添加token", "绑定") and argument:
+        # 只保存参数哈希：同一失效token/账号达到上限后停用，新凭据仍可验证。
+        failure_key += ":" + hashlib.sha256(argument.encode()).hexdigest()
     if command == "帮助":
         await bot.send(await help_image())
         return
     try:
-        service.require_database()
+        if command not in ("恢复", "状态") and service.failures.blocked(failure_key):
+            raise WuwaError("该命令连续失败已达到上限，处理后请用 wt恢复 或添加有效token重置计数。")
+        if command != "状态":
+            service.require_database()
         if command == "添加token":
             match = re.fullmatch(r"(\S+)(?:\s+(国服|海外))?", argument)
             if match is None:
@@ -140,20 +149,37 @@ async def wt_command(bot: Bot, event: Event) -> None:
             if force and event.user_pm > 1:
                 raise WuwaError("强制更新资源仅限 Bot 管理员使用。")
             await bot.send("开始更新中文名称与物品图库，完成后会回复统计结果。")
+            await service.failures.success("resources")
             replies = [await resources.update(force=force)]
+            if resources.incomplete:
+                await service.failures.fail("resources", "资源更新", replies[0])
         else:
             replies = [help_text(get_plugin_available_prefix("WuwaTappoUID"))]
+        if command in ("恢复", "添加token", "绑定"):
+            await service.failures.reset_commands(identity(event.bot_id, event.user_id))
+        await service.failures.success(failure_key)
     except AuthenticationError as error:
         await service.pause_after_auth_failure(event)
+        await service.command_failure(event, command, error, failure_key)
+        replies = [str(error)]
+    except (ApiError, DataError, NetworkError) as error:
+        await service.command_failure(event, command, error, failure_key)
         replies = [str(error)]
     except WuwaError as error:
         replies = [str(error)]
     except SQLAlchemyError as error:
-        service.disable_database(error)
+        await service.disable_database(error)
         replies = [service.database_error]
-    except (DatabaseWriteTimeout, WriteGateTimeout):
-        logger.exception("[WuwaTappoUID] 命令的数据库操作失败")
+    except (DatabaseWriteTimeout, WriteGateTimeout) as error:
+        await service.command_failure(event, command, error, failure_key)
         replies = ["数据库未能完成本次操作。请稍后用 wt次数 或 wt宝箱 确认实际状态后再操作。"]
+    except Exception as error:
+        if service.failures.attempts(failure_key) == 0:
+            logger.exception("[WuwaTappoUID] 命令出现意外错误")
+        await service.command_failure(event, command, error, failure_key)
+        replies = [f"命令异常（{type(error).__name__}），已记录；请检查实际状态后再操作。"]
+    finally:
+        await service.failures.flush_alerts()
     segments = [
         MessageSegment.image(reply) if isinstance(reply, bytes) else MessageSegment.text(reply) for reply in replies
     ]

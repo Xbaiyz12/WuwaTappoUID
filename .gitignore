@@ -19,3 +19,4 @@ build/
 dist/
 backups/
 session-import.json
+failure_state.json

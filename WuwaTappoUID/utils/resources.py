@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from .api import JSON, Download, WuwaAPI, parse
 from .item_image import render_tile
 from .schema import ASSET_MANIFEST_PATH, AssetManifest, DataError, DesktopCharacter, Dictionary, Item, WuwaError
+from .settings import retry_limit
 
 DEFAULT_HOST = "https://mc-wuwatappo.kurogames-global.com"
 CacheModel = TypeVar("CacheModel", bound=BaseModel)
@@ -194,9 +195,9 @@ class Resources:
                 messages.append(f"图鉴目录已同步（{len(items)} 项）。")
             except (WuwaError, OSError) as error:
                 problems.append(self._error("图鉴目录更新", error))
-            updated, skipped, failed = await self._sync_images(force)
-            messages.append(f"物品图：下载 {updated}，跳过 {skipped}，失败 {failed}。")
-            if failed:
+            updated, skipped, failed, deferred = await self._sync_images(force)
+            messages.append(f"物品图：下载 {updated}，跳过 {skipped}，失败 {failed}，待补齐 {deferred}。")
+            if failed or deferred:
                 problems.append("部分图片下载失败，后续普通更新会继续补齐。")
         try:
             await asyncio.to_thread(self._write_file, self.state_path, self.state.model_dump_json().encode())
@@ -224,27 +225,42 @@ class Resources:
         # 清单 URL 带版本参数；地址或版本变化就对应新文件，未变化的图片直接复用。
         return self.raw_dir / f"{hashlib.sha256(url.encode()).hexdigest()}.png"
 
-    async def _sync_images(self, force: bool) -> tuple[int, int, int]:
+    async def _sync_images(self, force: bool) -> tuple[int, int, int, int]:
         assert self.manifest is not None
         urls = sorted({self._image_url(relative) for relative in self.manifest.images().values()})
         semaphore = asyncio.Semaphore(4)
+        consecutive_failures = 0
 
         async def sync(url: str) -> str:
+            nonlocal consecutive_failures
             async with semaphore:
                 path = self._raw_path(url)
                 try:
                     if not force and path.exists() and path.stat().st_size:
                         return "skipped"
+                    # 连续失败后不再发起本轮剩余下载；在途请求正常收尾。
+                    if consecutive_failures >= retry_limit():
+                        return "deferred"
                     raw = await self.api.fetch_bytes(url)
                     await asyncio.to_thread(self._verify_image, raw)
                     await asyncio.to_thread(self._write_file, path, raw)
+                    consecutive_failures = 0
                     return "updated"
                 except (WuwaError, OSError, ValueError) as error:
-                    logger.warning(f"[WuwaTappoUID] {self._error('物品图下载', error)}")
+                    consecutive_failures += 1
+                    if consecutive_failures == 1:
+                        logger.warning(f"[WuwaTappoUID] {self._error('物品图下载', error)}")
+                    elif consecutive_failures == retry_limit():
+                        logger.warning("[WuwaTappoUID] 资源站连续失败达到上限，本轮剩余图片等待后续补齐。")
                     return "failed"
 
         results = await asyncio.gather(*(sync(url) for url in urls))
-        return results.count("updated"), results.count("skipped"), results.count("failed")
+        return (
+            results.count("updated"),
+            results.count("skipped"),
+            results.count("failed"),
+            results.count("deferred"),
+        )
 
     @staticmethod
     def _verify_image(raw: bytes) -> None:

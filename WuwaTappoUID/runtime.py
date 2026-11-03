@@ -16,6 +16,7 @@ from .utils.database import Account, AccountLink, Binding, Store, ensure_databas
 from .utils.resources import Resources
 from .utils.schema import DatabaseSchemaError, DataError, SessionImport, token_expiry
 from .utils.service import Service, account_id, identity
+from .utils.settings import retry_limit
 
 ROOT = get_res_path("WuwaTappoUID")
 api = WuwaAPI()
@@ -23,6 +24,7 @@ resources = Resources(api, ROOT)
 service = Service(api, resources)
 NOTICE_JOB = "WuwaTappoUID:notice"
 RESOURCE_JOB = "WuwaTappoUID:resources"
+ALERT_JOB = "WuwaTappoUID:alerts"
 _initialize_lock = asyncio.Lock()
 _initialize_attempted = False
 
@@ -62,6 +64,8 @@ async def import_sessions() -> None:
             Binding(id=owner, platform=entry.platform, user_id=entry.user_id, account_id=account.id),
             AccountLink(owner_id=owner, account_id=account.id),
         )
+        await service.failures.reset_account(account.id)
+        await Store.reset_notice_attempts(account.id)
     # 成功后移除明文导入文件；token 只保存在 GS 数据库中。
     await asyncio.to_thread(path.unlink)
     logger.info(f"[WuwaTappoUID] 已导入 {len(entries)} 个登录态，导入文件已移除。")
@@ -75,41 +79,75 @@ async def wt_initialize() -> None:
             return
         _initialize_attempted = True
         try:
+            await service.failures.load()
+            logger.info(f"[WuwaTappoUID] 已加载持久化重试状态，连续失败上限 {retry_limit()} 次。")
             await ensure_database_schema()
             await api.start()
             await resources.load()
             await import_sessions()
         except (SQLAlchemyError, DatabaseSchemaError) as error:
-            service.disable_database(error)
+            await service.disable_database(error)
+            return
+        except Exception as error:
+            logger.exception("[WuwaTappoUID] 插件初始化失败")
+            service.database_error = "插件初始化失败，后台任务未启动，请检查首次异常并重启。"
+            await service.failures.fail("initialize", "插件初始化", service.error_detail(error), limit=1)
             return
         service.database_ready = True
         service.database_error = ""
+        await service.failures.success("database")
+        await service.failures.success("initialize")
 
 
 async def wt_update_resources() -> None:
-    # 单次请求有重试；整轮仍失败或图片未下全时，再按间隔补齐。
-    for delay in (0, 30, 120, 300):
+    # 整轮失败计数持久化；重启也不会重新获得自动更新预算。
+    for _ in range(retry_limit()):
+        if service.failures.blocked("resources"):
+            return
+        delay = max(0, service.failures.retry_after("resources") - time.time())
         if delay:
             await asyncio.sleep(delay)
         if service.closing:
             return
-        logger.info(f"[WuwaTappoUID] {await resources.update()}")
-        if not resources.incomplete or service.closing:
+        try:
+            result = await resources.update()
+        except Exception as error:
+            if service.failures.attempts("resources") == 0:
+                logger.exception("[WuwaTappoUID] 资源更新出现意外错误")
+            await service.failures.fail("resources", "资源更新", service.error_detail(error))
+        else:
+            logger.info(f"[WuwaTappoUID] {result}")
+            if not resources.incomplete:
+                await service.failures.success("resources")
+                return
+            await service.failures.fail("resources", "资源更新", result)
+        await service.failures.flush_alerts()
+        if service.closing:
             return
-    logger.warning("[WuwaTappoUID] 资源仍未全部更新，已有资源继续可用；可发送 wt更新资源 补齐。")
 
 
 @on_core_start
 async def wt_start() -> None:
     # GS 捕获启动前异常后仍会执行启动后钩子；若初始化被跳过，在这里补做一次。
     await wt_initialize()
+    # 告警投递独立于插件数据库，数据库被停用后仍能通知 GS 主人。
+    scheduler.add_job(
+        service.failures.flush_alerts,
+        "interval",
+        seconds=60,
+        id=ALERT_JOB,
+        name="WuwaTappo 主人故障告警",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
     if not service.database_ready:
         logger.error("[WuwaTappoUID] 初始化未完成，不恢复宝箱任务；请检查首次启动异常。")
         return
     try:
         await service.restore()
     except SQLAlchemyError as error:
-        service.disable_database(error)
+        await service.disable_database(error)
         return
     scheduler.add_job(
         service.maintain,
@@ -131,6 +169,7 @@ async def wt_start() -> None:
 
 @gss.on_bot_connect
 async def wt_bot_connected() -> None:
+    await service.failures.flush_alerts()
     await service.flush_notices()
 
 

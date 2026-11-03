@@ -200,6 +200,15 @@ async def ensure_database_schema() -> None:
 
 class Store:
     @classmethod
+    @with_session
+    async def reset_notice_attempts(cls, session: AsyncSession, account_id: str) -> None:
+        result = await session.execute(
+            select(Notice).where(col(Notice.account_id) == account_id, col(Notice.submitted).is_(False))
+        )
+        for notice in result.scalars().all():
+            notice.attempts = 0
+
+    @classmethod
     @with_read_session
     async def statistics(cls, session: AsyncSession) -> tuple[int, int, int]:
         bound_people = await session.scalar(select(func.count()).select_from(Binding))
