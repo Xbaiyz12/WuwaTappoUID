@@ -1,12 +1,15 @@
 """异步 HTTP 与脚本使用的 Engine.IO v4 点击协议。"""
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import TypeVar
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import wraps
+from typing import ParamSpec, TypeVar
 
 import aiohttp
 from gsuid_core.logger import logger
@@ -35,10 +38,48 @@ from .schema import (
 
 T = TypeVar("T", bound=BaseModel)
 R = TypeVar("R")
+P = ParamSpec("P")
 JSON = TypeAdapter(JsonValue)
 ITEMS = TypeAdapter(list[Item])
 RETRY_DELAYS = (1, 3, 5)
 RESOURCE_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=8, sock_read=12)
+
+
+@dataclass
+class ReadCache:
+    active: bool = True
+    users: dict[tuple[str, int], UserInfo] = field(default_factory=dict)
+    bags: dict[tuple[str, int], list[Item]] = field(default_factory=dict)
+    roles: dict[tuple[str, int], list[RoleInfo]] = field(default_factory=dict)
+
+
+_read_cache: ContextVar[ReadCache | None] = ContextVar("wt_read_cache", default=None)
+
+
+def with_read_cache(operation: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    @wraps(operation)
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        cache = ReadCache()
+        token = _read_cache.set(cache)
+        try:
+            return await operation(*args, **kwargs)
+        finally:
+            cache.active = False
+            _read_cache.reset(token)
+
+    return wrapped
+
+
+def network_details(path: str, error: Exception, status: int | None = None, request_id: str = "") -> str:
+    if isinstance(error, aiohttp.ClientConnectorCertificateError):
+        reason = str(error.certificate_error)
+    elif isinstance(error, aiohttp.ClientConnectorError):
+        reason = str(error.os_error)
+    elif isinstance(error, TimeoutError):
+        reason = "请求超时"
+    else:
+        reason = type(error).__name__
+    return f"接口 {path}，HTTP {status}，异常 {type(error).__name__}，原因 {reason}，请求ID {request_id or '未提供'}"
 
 
 async def retry_network(operation: Callable[[], Awaitable[R]], label: str) -> R:
@@ -47,9 +88,11 @@ async def retry_network(operation: Callable[[], Awaitable[R]], label: str) -> R:
             return await operation()
         except NetworkError as error:
             if attempt == len(RETRY_DELAYS):
-                raise NetworkError(f"{error}（已重试 3 次）") from None
+                logger.warning(f"[WuwaTappoUID] {label}已重试3次仍未完成：{error.details}。")
+                raise NetworkError(f"{error}（已重试 3 次）", error.details) from None
             delay = RETRY_DELAYS[attempt]
-            logger.warning(f"[WuwaTappoUID] {label}网络失败，{delay} 秒后重试（{attempt + 1}/3）。")
+            if attempt == 0:
+                logger.warning(f"[WuwaTappoUID] {label}首次网络失败，将按1/3/5秒重试：{error.details}。")
             await asyncio.sleep(delay)
     raise RuntimeError("网络重试没有产生结果")
 
@@ -65,13 +108,26 @@ class Download:
 def parse(model: type[T], data: object) -> T:
     try:
         return model.model_validate(data)
-    except ValidationError:
-        raise DataError("游戏接口缺少必要字段或字段格式已变化，请管理员检查接口。") from None
+    except ValidationError as error:
+        fields = "、".join(
+            f"{'.'.join(str(part) for part in entry['loc']) or '响应'}:{entry['type']}"
+            for entry in error.errors(include_input=False, include_context=False, include_url=False)
+        )
+        raise DataError(f"{model.__name__}响应字段格式已变化：{fields}。") from None
 
 
 class WuwaAPI:
     def __init__(self) -> None:
         self.session: aiohttp.ClientSession | None = None
+        self._versions: dict[str, int] = {}
+
+    def _read_key(self, token: str) -> tuple[str, int]:
+        key = hashlib.sha256(token.encode()).hexdigest()
+        return key, self._versions.get(key, 0)
+
+    def invalidate(self, token: str) -> None:
+        key, version = self._read_key(token)
+        self._versions[key] = version + 1
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(
@@ -95,21 +151,33 @@ class WuwaAPI:
         async def request() -> Envelope:
             return await self._fetch_once(url, method, payload, token)
 
-        return await retry_network(request, "接口请求") if retry else await request()
+        if retry:
+            return await retry_network(request, "接口请求")
+        try:
+            return await request()
+        except NetworkError as error:
+            logger.warning(f"[WuwaTappoUID] 本次接口请求结果未确认：{error.details}。")
+            raise
 
     async def _fetch_once(self, url: str, method: str, payload: object, token: str) -> Envelope:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         path = url.removeprefix(BASE).split("?", 1)[0]
+        request_id = ""
+        status = None
         try:
             async with self.client().request(method, url, json=payload, headers=headers) as response:
                 request_id = response.headers.get("x-request-id", "")
+                status = response.status
                 try:
                     envelope = Envelope.model_validate_json(await response.text())
                 except ValidationError:
                     if response.status in (401, 403):
                         raise ApiError(None, http_status=response.status, path=path, request_id=request_id) from None
                     if response.status >= 500 or response.status in (408, 429):
-                        raise NetworkError(f"服务端暂不可用（HTTP {response.status}）。") from None
+                        raise NetworkError(
+                            f"服务端暂不可用（HTTP {response.status}）。",
+                            f"接口 {path}，HTTP {status}，请求ID {request_id or '未提供'}，无有效业务响应",
+                        ) from None
                     raise DataError(f"接口 {path} 未返回有效业务响应（HTTP {response.status}）。") from None
                 request_id = envelope.request_id or request_id
                 if envelope.code not in CODE_OK:
@@ -117,13 +185,17 @@ class WuwaAPI:
                 if response.status in (401, 403):
                     raise ApiError(None, http_status=response.status, path=path, request_id=request_id)
                 if response.status >= 500 or response.status in (408, 429):
-                    raise NetworkError(f"服务端暂不可用（HTTP {response.status}），稍后再查询。")
+                    raise NetworkError(
+                        f"服务端暂不可用（HTTP {response.status}），稍后再查询。",
+                        f"接口 {path}，HTTP {status}，业务码 {envelope.code}，请求ID {request_id or '未提供'}",
+                    )
                 if response.status >= 400:
                     raise DataError(f"请求被拒绝（HTTP {response.status}），请管理员检查接口。")
                 return envelope
-        except (aiohttp.ClientError, TimeoutError):
-            logger.warning(f"[WuwaTappoUID] 接口 {path} 网络中断或超时，未判定为 token 失效。")
-            raise NetworkError("网络请求失败或超时，暂时无法确认服务端结果。") from None
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise NetworkError(
+                "网络请求失败或超时，暂时无法确认服务端结果。", network_details(path, error, status, request_id)
+            ) from None
 
     async def download(self, url: str, limit: int = 4_000_000, *, etag: str = "", last_modified: str = "") -> Download:
         async def request() -> Download:
@@ -142,7 +214,11 @@ class WuwaAPI:
                 if response.status == 304:
                     return Download(b"", etag, last_modified, not_modified=True)
                 if response.status >= 500 or response.status in (408, 429):
-                    raise NetworkError(f"资源服务暂不可用（HTTP {response.status}）。")
+                    raise NetworkError(
+                        f"资源服务暂不可用（HTTP {response.status}）。",
+                        f"资源 {url.split('?', 1)[0]}，HTTP {response.status}，"
+                        f"请求ID {response.headers.get('x-request-id', '未提供')}",
+                    )
                 if response.status >= 400:
                     raise DataError(f"资源下载被拒绝（HTTP {response.status}）。")
                 if response.content_length is not None and response.content_length > limit:
@@ -152,8 +228,8 @@ class WuwaAPI:
                 if len(body) > limit:
                     raise DataError("资源文件过大，已跳过。")
                 return Download(body, response.headers.get("ETag", ""), response.headers.get("Last-Modified", ""))
-        except (aiohttp.ClientError, TimeoutError):
-            raise NetworkError("资源下载失败或超时。") from None
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise NetworkError("资源下载失败或超时。", network_details(url.split("?", 1)[0], error)) from None
 
     async def fetch_bytes(self, url: str, limit: int = 4_000_000) -> bytes:
         return (await self.download(url, limit)).body
@@ -164,6 +240,8 @@ class WuwaAPI:
         try:
             response = await self.fetch(BASE + path, method, payload, token, retry=retry)
         except ApiError as error:
+            if token and error.is_auth:
+                self.invalidate(token)
             logger.warning(f"[WuwaTappoUID] 接口拒绝请求：{error.details}。")
             raise
         return response.payload()
@@ -193,13 +271,31 @@ class WuwaAPI:
 
     async def roles(self, cuid: str, domestic: int) -> list[RoleInfo]:
         """不需要登录的角色查询；只读，可以随网络重试。"""
+        cache = _read_cache.get()
+        key = (cuid, domestic)
+        if cache is not None and cache.active and key in cache.roles:
+            return cache.roles[key]
         data = await self.request("/api/auth/player/query", payload={"cuid": cuid, "is_domestic": domestic})
-        return parse(RoleQuery, data).items
+        roles = parse(RoleQuery, data).items
+        if cache is not None and cache.active:
+            cache.roles[key] = roles
+        return roles
 
-    async def me(self, token: str) -> UserInfo:
-        return parse(UserInfo, await self.request("/api/frontend/user/me", "GET", token=token))
+    async def me(self, token: str, *, fresh: bool = False) -> UserInfo:
+        cache = _read_cache.get()
+        key = self._read_key(token)
+        if not fresh and cache is not None and cache.active and key in cache.users:
+            return cache.users[key]
+        info = parse(UserInfo, await self.request("/api/frontend/user/me", "GET", token=token))
+        if cache is not None and cache.active and key == self._read_key(token):
+            cache.users[key] = info
+        return info
 
-    async def bags(self, token: str) -> list[Item]:
+    async def bags(self, token: str, *, fresh: bool = False) -> list[Item]:
+        cache = _read_cache.get()
+        key = self._read_key(token)
+        if not fresh and cache is not None and cache.active and key in cache.bags:
+            return cache.bags[key]
         data = await self.request("/api/frontend/bags/list", payload={}, token=token)
         if isinstance(data, dict):
             for key in ("list", "items", "appearances"):
@@ -207,9 +303,12 @@ class WuwaAPI:
                     data = data[key]
                     break
         try:
-            return ITEMS.validate_python(data)
+            items = ITEMS.validate_python(data)
         except ValidationError:
             raise DataError("背包响应格式已变化，无法将其当作空背包。") from None
+        if cache is not None and cache.active and key == self._read_key(token):
+            cache.bags[key] = items
+        return items
 
     async def atlas(self) -> list[Item]:
         data = await self.request("/api/common/atlas", "GET")
@@ -219,12 +318,14 @@ class WuwaAPI:
             raise DataError("图鉴响应格式已变化，无法确定各品类的最高合成阶级。") from None
 
     async def synthesize(self, token: str, asset_ids: list[int], same_level: bool) -> SynthesisResult:
+        self.invalidate(token)
         path = "/api/frontend/assets/synthesis" + ("/same-level" if same_level else "")
         # 材料会被消耗，超时或响应异常时不能盲目重发。
         data = await self.request(path, payload={"asset_ids": asset_ids}, token=token, retry=False)
         return parse(SynthesisResult, data)
 
     async def open(self, token: str, side: Side, total: int) -> OpenResult:
+        self.invalidate(token)
         return parse(
             OpenResult,
             # 开箱由 Service 根据持久化流水确认结果后重试，不能在 HTTP 层直接重发。
@@ -239,7 +340,7 @@ class WuwaAPI:
 
         async def submit() -> int:
             nonlocal attempted
-            if attempted and (await self.me(token)).total_click_count >= total:
+            if attempted and (await self.me(token, fresh=True)).total_click_count >= total:
                 return 0
             if expires_at is not None and time.time() >= expires_at:
                 raise Expired
@@ -249,6 +350,7 @@ class WuwaAPI:
         return await retry_network(submit, "点击连接")
 
     async def _set_clicks_once(self, token: str, total: int, expires_at: float | None) -> int:
+        self.invalidate(token)
         try:
             async with asyncio.timeout(15):
                 async with self.client().ws_connect(
@@ -294,11 +396,19 @@ class WuwaAPI:
                                 raise ApiError(code, path="/socket.io:cr")
                             return code
         except aiohttp.WSServerHandshakeError as error:
+            request_id = error.headers.get("x-request-id", "") if error.headers is not None else ""
             if error.status in (401, 403):
-                raise ApiError(None, http_status=error.status, path="/socket.io:connect") from None
-            raise NetworkError(f"点击连接握手失败（HTTP {error.status}），需回读实际点击数。") from None
-        except (aiohttp.ClientError, TimeoutError):
-            raise NetworkError("点击提交失败或超时，需重新查询实际点击数。") from None
+                raise ApiError(
+                    None, http_status=error.status, path="/socket.io:connect", request_id=request_id
+                ) from None
+            raise NetworkError(
+                f"点击连接握手失败（HTTP {error.status}），需回读实际点击数。",
+                network_details("/socket.io:connect", error, error.status, request_id),
+            ) from None
+        except (aiohttp.ClientError, TimeoutError) as error:
+            raise NetworkError(
+                "点击提交失败或超时，需重新查询实际点击数。", network_details("/socket.io:cr", error)
+            ) from None
         except ValidationError:
             raise DataError("点击确认帧不是有效 JSON。") from None
         raise NetworkError("点击连接已关闭，未收到服务端确认。")

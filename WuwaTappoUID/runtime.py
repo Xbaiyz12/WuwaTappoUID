@@ -11,7 +11,7 @@ from gsuid_core.server import on_core_shutdown, on_core_start, on_core_start_bef
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
-from .utils.api import WuwaAPI
+from .utils.api import WuwaAPI, with_read_cache
 from .utils.database import Account, AccountLink, Binding, Store, ensure_database_schema
 from .utils.resources import Resources
 from .utils.schema import DatabaseSchemaError, DataError, SessionImport, token_expiry
@@ -168,6 +168,7 @@ async def wt_start() -> None:
 
 
 @gss.on_bot_connect
+@with_read_cache
 async def wt_bot_connected() -> None:
     await service.failures.flush_alerts()
     await service.flush_notices()

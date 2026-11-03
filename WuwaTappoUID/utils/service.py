@@ -16,7 +16,7 @@ from gsuid_core.segment import MessageSegment
 from gsuid_core.subscribe import gs_subscribe
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
-from .api import WuwaAPI
+from .api import WuwaAPI, with_read_cache
 from .cards import Cards, ResultContext
 from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
 from .failures import Failures
@@ -109,7 +109,7 @@ class Service:
 
     @staticmethod
     def error_detail(error: Exception) -> str:
-        if isinstance(error, ApiError):
+        if isinstance(error, (ApiError, NetworkError)):
             return error.details
         return str(error) if isinstance(error, WuwaError) else type(error).__name__
 
@@ -169,7 +169,7 @@ class Service:
         if task is not None and task.status in ("active", "paused"):
             await Store.save(Notice(subscription_id=task.subscription_id, account_id=account.id, text=text))
 
-    async def refresh(self, account: Account) -> UserInfo:
+    async def refresh(self, account: Account, *, fresh: bool = False) -> UserInfo:
         # 调用方进入账号锁前可能已读取绑定，锁内以数据库中最新 token 为准。
         saved = await Store.account(account.id)
         if saved is not None:
@@ -184,7 +184,7 @@ class Service:
         if account.token_state == "ready":
             await self.renew_token_if_needed(account)
         try:
-            info = await self.api.me(account.token)
+            info = await self.api.me(account.token, fresh=fresh)
         except ApiError as error:
             if not error.is_auth:
                 raise
@@ -220,7 +220,7 @@ class Service:
         except WuwaError as error:
             account.token_renew_after = now + TOKEN_RENEW_RETRY
             await Store.save(account)
-            reason = error.details if isinstance(error, ApiError) else type(error).__name__
+            reason = self.error_detail(error)
             failure = await self.failures.fail(failure_key, "原token续期", reason, account.id, delay=TOKEN_RENEW_RETRY)
             if failure.blocked:
                 await self.account_notice(
@@ -561,14 +561,14 @@ class Service:
         await self.flush_notices()
         return images
 
-    async def read_bag(self, account: Account) -> list[Item]:
+    async def read_bag(self, account: Account, *, fresh: bool = False) -> list[Item]:
         try:
-            return await self.api.bags(account.token)
+            return await self.api.bags(account.token, fresh=fresh)
         except ApiError as error:
             if not error.is_auth:
                 raise
-            await self.refresh(account)
-            return await self.api.bags(account.token)
+            await self.refresh(account, fresh=True)
+            return await self.api.bags(account.token, fresh=True)
 
     async def synthesize(self, event: Event, same_level: bool = False) -> list[str | bytes]:
         results: list[SynthesisResult] = []
@@ -616,11 +616,11 @@ class Service:
                             relogged = True
                             previous_token = account.token
                             try:
-                                await self.refresh(account)
+                                await self.refresh(account, fresh=True)
                                 if account.token == previous_token:
                                     problem = "合成请求被拒绝，但账号查询确认原 token 可用；已保留会话并停止本轮。"
                                     break
-                                items = await self.read_bag(account)
+                                items = await self.read_bag(account, fresh=True)
                             except WuwaError as login_error:
                                 problem = str(login_error)
                                 break
@@ -641,7 +641,7 @@ class Service:
                     upgrades += int(not recipe.same_level)
                     spent += len(recipe.asset_ids)
                     try:
-                        items = await self.read_bag(account)
+                        items = await self.read_bag(account, fresh=True)
                     except WuwaError as error:
                         bag_current = False
                         problem = f"已保存本次合成结果，但背包回读失败：{error}。本轮已停止。"
@@ -698,7 +698,7 @@ class Service:
             submission_error = error
             problem = str(error)
         # 重连只提交固定目标累计值；最终仍按服务端实际变化作答。
-        after = await self.refresh(account)
+        after = await self.refresh(account, fresh=True)
         delta = after.total_click_count - before.total_click_count
         if task is not None and delta <= 0 and submission_error is not None:
             raise submission_error
@@ -847,7 +847,7 @@ class Service:
             account = await Store.account(task.account_id)
             if account is not None:
                 try:
-                    info = await self.api.me(account.token)
+                    info = await self.api.me(account.token, fresh=True)
                     if str(info.cuid) != account.cuid:
                         raise DataError("结束任务核对的CUID与账号不一致。")
                 except WuwaError as error:
@@ -1105,7 +1105,7 @@ class Service:
                 if error.is_auth:
                     # 先验证原会话，本次不再次提交开箱。
                     previous_token = account.token
-                    await self.refresh(account)
+                    await self.refresh(account, fresh=True)
                     if account.token == previous_token:
                         raise WuwaError("开箱请求被拒绝，但原 token 仍可查询；会话已保留，本次停止开箱。") from None
                     raise NetworkError("开箱请求鉴权失败，账号查询确认后已恢复会话，稍后重新检查。") from None
@@ -1115,16 +1115,17 @@ class Service:
             except (NetworkError, DataError):
                 # 冷却推进就结算成功；120 秒后确认未生效才重试，累计最多初次加 3 次。
                 await self.queue_results(account.id, force=True, reason="开箱响应中断")
-                fresh = await self.refresh(account)
+                fresh = await self.refresh(account, fresh=True)
                 await self.reconcile(task, fresh)
                 return fresh
             record.result = result.model_dump_json()
             await Store.save(record)
-            fresh = await self.refresh(account)
+            fresh = await self.refresh(account, fresh=True)
             await self.record_success(task, record)
             return fresh
         raise RuntimeError("开箱重试流程没有产生结果")
 
+    @with_read_cache
     async def tick(self, key: str) -> None:
         if self.closing or not self.database_ready:
             return
@@ -1285,6 +1286,7 @@ class Service:
                     await Store.save(task)
                     self.schedule(task)
 
+    @with_read_cache
     async def maintain(self) -> None:
         """每分钟执行：补排丢失了下次检查的任务，再补发待提交的通知。"""
         if self.closing or not self.database_ready:
@@ -1330,7 +1332,7 @@ class Service:
                         continue
                     try:
                         # 结束后只查询原登录态，不重新登录、不提交点击或开箱。
-                        info = await self.api.me(account.token)
+                        info = await self.api.me(account.token, fresh=True)
                         if str(info.cuid) != account.cuid:
                             raise DataError("核对返回的 CUID 与账号不一致。")
                         account.info = info.model_dump_json()

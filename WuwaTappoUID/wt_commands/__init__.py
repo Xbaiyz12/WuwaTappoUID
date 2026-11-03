@@ -16,6 +16,7 @@ from gsuid_core.utils.image.convert import convert_img
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..runtime import resources, service
+from ..utils.api import with_read_cache
 from ..utils.help_card import help_text, render
 from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
 from ..utils.service import identity
@@ -59,6 +60,7 @@ COMMANDS = (
 
 
 @sv.on_command((*COMMANDS, "帮助"), block=True)
+@with_read_cache
 async def wt_command(bot: Bot, event: Event) -> None:
     # GS 会把命令本身放在 command，把剥离命令后的参数放在 text。
     command = event.command.removeprefix("wt").strip()

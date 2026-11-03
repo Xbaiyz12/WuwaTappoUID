@@ -63,6 +63,10 @@ class ApiError(WuwaError):
 class NetworkError(WuwaError):
     """网络失败或服务端暂不可用；修改请求可能已经到达服务端。"""
 
+    def __init__(self, message: str, details: str = ""):
+        super().__init__(message)
+        self.details = details or message
+
 
 class DataError(WuwaError):
     """响应数据不符合当前接口结构。"""
