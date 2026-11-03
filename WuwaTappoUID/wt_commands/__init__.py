@@ -65,6 +65,7 @@ async def wt_command(bot: Bot, event: Event) -> None:
         await bot.send(await help_image())
         return
     try:
+        service.require_database()
         if command == "添加token":
             match = re.fullmatch(r"(\S+)(?:\s+(国服|海外))?", argument)
             if match is None:
@@ -147,7 +148,10 @@ async def wt_command(bot: Bot, event: Event) -> None:
         replies = [str(error)]
     except WuwaError as error:
         replies = [str(error)]
-    except (DatabaseWriteTimeout, WriteGateTimeout, SQLAlchemyError):
+    except SQLAlchemyError as error:
+        service.disable_database(error)
+        replies = [service.database_error]
+    except (DatabaseWriteTimeout, WriteGateTimeout):
         logger.exception("[WuwaTappoUID] 命令的数据库操作失败")
         replies = ["数据库未能完成本次操作。请稍后用 wt次数 或 wt宝箱 确认实际状态后再操作。"]
     segments = [

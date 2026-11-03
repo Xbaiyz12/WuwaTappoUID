@@ -9,11 +9,12 @@ from gsuid_core.gss import gss
 from gsuid_core.logger import logger
 from gsuid_core.server import on_core_shutdown, on_core_start, on_core_start_before
 from pydantic import TypeAdapter, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from .utils.api import WuwaAPI
-from .utils.database import Account, AccountLink, Binding, Store, migrate_notice_columns
+from .utils.database import Account, AccountLink, Binding, Store, ensure_database_schema
 from .utils.resources import Resources
-from .utils.schema import DataError, SessionImport, token_expiry
+from .utils.schema import DatabaseSchemaError, DataError, SessionImport, token_expiry
 from .utils.service import Service, account_id, identity
 
 ROOT = get_res_path("WuwaTappoUID")
@@ -22,6 +23,8 @@ resources = Resources(api, ROOT)
 service = Service(api, resources)
 NOTICE_JOB = "WuwaTappoUID:notice"
 RESOURCE_JOB = "WuwaTappoUID:resources"
+_initialize_lock = asyncio.Lock()
+_initialize_attempted = False
 
 
 async def import_sessions() -> None:
@@ -66,11 +69,21 @@ async def import_sessions() -> None:
 
 @on_core_start_before(priority=0)
 async def wt_initialize() -> None:
-    # GS 的建表钩子优先级 -90，先补旧表列并迁移账号关联，再恢复任务。
-    await migrate_notice_columns()
-    await api.start()
-    await resources.load()
-    await import_sessions()
+    global _initialize_attempted
+    async with _initialize_lock:
+        if _initialize_attempted:
+            return
+        _initialize_attempted = True
+        try:
+            await ensure_database_schema()
+            await api.start()
+            await resources.load()
+            await import_sessions()
+        except (SQLAlchemyError, DatabaseSchemaError) as error:
+            service.disable_database(error)
+            return
+        service.database_ready = True
+        service.database_error = ""
 
 
 async def wt_update_resources() -> None:
@@ -88,7 +101,16 @@ async def wt_update_resources() -> None:
 
 @on_core_start
 async def wt_start() -> None:
-    await service.restore()
+    # GS 捕获启动前异常后仍会执行启动后钩子；若初始化被跳过，在这里补做一次。
+    await wt_initialize()
+    if not service.database_ready:
+        logger.error("[WuwaTappoUID] 初始化未完成，不恢复宝箱任务；请检查首次启动异常。")
+        return
+    try:
+        await service.restore()
+    except SQLAlchemyError as error:
+        service.disable_database(error)
+        return
     scheduler.add_job(
         service.maintain,
         "interval",

@@ -14,6 +14,7 @@ from gsuid_core.logger import logger
 from gsuid_core.models import Event, Message
 from gsuid_core.segment import MessageSegment
 from gsuid_core.subscribe import gs_subscribe
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from .api import WuwaAPI, retry_network
 from .cards import Cards, ResultContext
@@ -32,6 +33,7 @@ from .schema import (
     TOKEN_RENEW_WINDOW,
     ApiError,
     AuthenticationError,
+    DatabaseSchemaError,
     DataError,
     Expired,
     Item,
@@ -78,6 +80,31 @@ class Service:
         self._notice_images: OrderedDict[str, CachedNoticeImage] = OrderedDict()
         self._notice_image_bytes = 0
         self.closing = False
+        self.database_ready = False
+        self.database_error = "插件尚未完成数据库初始化，请稍后重试。"
+
+    def require_database(self) -> None:
+        if not self.database_ready:
+            raise WuwaError(self.database_error)
+
+    def disable_database(self, error: SQLAlchemyError | DatabaseSchemaError) -> None:
+        message = "插件数据库初始化或操作失败，后台任务已停止；请更新插件并重启 GsCore。"
+        if self.database_error == message:
+            return
+        self.database_ready = False
+        self.database_error = message
+        for job in scheduler.get_jobs():
+            if job.id.startswith("WuwaTappoUID:chest:") or job.id == "WuwaTappoUID:notice":
+                job.remove()
+        # 不输出 ORM SQL 或绑定参数，其中可能含 token。
+        detail = (
+            str(error.orig)
+            if isinstance(error, DBAPIError)
+            else str(error)
+            if isinstance(error, DatabaseSchemaError)
+            else type(error).__name__
+        )
+        logger.error(f"[WuwaTappoUID] {message} {type(error).__name__}：{detail}")
 
     def account_lock(self, key: str) -> asyncio.Lock:
         return self._accounts.setdefault(key, asyncio.Lock())
@@ -614,7 +641,7 @@ class Service:
         if task.timer_paused:
             self.unschedule(task.account_id)
             return
-        if self.closing or task.status not in ("active", "paused"):
+        if self.closing or not self.database_ready or task.status not in ("active", "paused"):
             return
         scheduler.add_job(
             self.tick,
@@ -638,6 +665,9 @@ class Service:
     @staticmethod
     def next_wakeup(task: ChestTask, info: UserInfo | None, retry: bool = False) -> float:
         now = time.time()
+        if retry:
+            # 失败后不使用已经过去的提醒/到期点，避免 0.1 秒循环。
+            return min(now + 60, task.expires_at) if task.expires_at > now else now + 60
         candidates = [task.expires_at]
         if not task.reminded:
             # 剩余不超过 1 小时进入提醒与续期窗口。
@@ -711,6 +741,11 @@ class Service:
         return [answer, image]
 
     async def finish(self, task: ChestTask, status: str, reason: str) -> None:
+        # 先持久化结束状态并撤销调度，结果核对/汇总失败不能阻止任务停止。
+        task.status = status
+        task.paused_at = None
+        await Store.save(task)
+        self.unschedule(task.account_id)
         pending = await Store.unresolved(task.account_id)
         if pending:
             info: UserInfo | None = None
@@ -729,8 +764,6 @@ class Service:
                         await self.record_success(task, record)
         unresolved_count = len(await Store.unresolved(task.account_id))
         await self.queue_results(task.account_id, force=True, reason=reason)
-        task.status = status
-        task.paused_at = None
         await Store.save(
             task,
             Notice(
@@ -740,7 +773,6 @@ class Service:
                 + (f"另有 {unresolved_count} 个请求结果待确认，尚未计入。" if unresolved_count else ""),
             ),
         )
-        self.unschedule(task.account_id)
 
     async def stop_owned(self, binding: Binding, reason: str) -> str:
         task = await Store.task(binding.account_id)
@@ -964,13 +996,18 @@ class Service:
         raise RuntimeError("开箱重试流程没有产生结果")
 
     async def tick(self, key: str) -> None:
-        if self.closing:
+        if self.closing or not self.database_ready:
             return
-        await self._check_account(key)
-        await self.flush_notices()
+        try:
+            await self._check_account(key)
+            await self.flush_notices()
+        except SQLAlchemyError as error:
+            self.disable_database(error)
 
     async def _check_account(self, key: str) -> None:
         async with self.account_lock(key):
+            if self.closing or not self.database_ready:
+                return
             task = await Store.task(key)
             if task is None or task.status not in ("active", "paused"):
                 return
@@ -1063,6 +1100,8 @@ class Service:
                     ),
                 )
                 retry = True
+            except SQLAlchemyError as error:
+                self.disable_database(error)
             except Exception:
                 # GS 数据库写锁超时等意外错误：不计入明确失败，稍后重试；留下的流水由下次核对。
                 logger.exception("[WuwaTappoUID] 宝箱检查出现意外错误，稍后重试")
@@ -1070,14 +1109,16 @@ class Service:
                 interrupted = True
             finally:
                 # 先在内存里排好下次检查，数据库写入或推送再出错也不会让任务停摆。
-                if task.status in ("active", "paused"):
+                if self.database_ready and task.status in ("active", "paused"):
                     task.next_check = self.next_wakeup(task, info, retry)
                     self.schedule(task)
                 try:
-                    if interrupted:
+                    if self.database_ready and interrupted:
                         await self.queue_results(key, force=True, reason="任务中断，汇总已开结果")
-                    if task.status in ("active", "paused"):
+                    if self.database_ready and task.status in ("active", "paused"):
                         await Store.save(task)
+                except SQLAlchemyError as error:
+                    self.disable_database(error)
                 except Exception:
                     logger.exception("[WuwaTappoUID] 保存检查结果失败，下次检查时重试")
 
@@ -1097,6 +1138,14 @@ class Service:
 
     async def maintain(self) -> None:
         """每分钟执行：补排丢失了下次检查的任务，再补发待提交的通知。"""
+        if self.closing or not self.database_ready:
+            return
+        try:
+            await self._maintain()
+        except SQLAlchemyError as error:
+            self.disable_database(error)
+
+    async def _maintain(self) -> None:
         if not self.closing:
             for task in await Store.active_tasks():
                 if task.timer_paused:
@@ -1190,8 +1239,16 @@ class Service:
         return messages
 
     async def flush_notices(self) -> None:
+        if self.closing or not self.database_ready:
+            return
+        try:
+            await self._flush_notices()
+        except SQLAlchemyError as error:
+            self.disable_database(error)
+
+    async def _flush_notices(self) -> None:
         async with self._push_lock:
-            if not gss.active_bot:
+            if self.closing or not self.database_ready or not gss.active_bot:
                 return
             # 同一订阅仍指向原任务和会话，离线积压的多张图也一起补发。
             groups: dict[int, list[Notice]] = {}
@@ -1217,6 +1274,8 @@ class Service:
                         if key not in accounts:
                             accounts[key] = await Store.account(key)
                         contents.extend(await self.notice_messages(notice, event, accounts[key], contexts))
+                except SQLAlchemyError:
+                    raise
                 except Exception:
                     logger.exception("[WuwaTappoUID] 通知图片绘制失败，保留本组待发通知")
                     continue

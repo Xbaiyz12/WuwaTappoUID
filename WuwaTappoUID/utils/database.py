@@ -8,9 +8,12 @@ from gsuid_core.models import Event
 from gsuid_core.utils.database import base_models
 from gsuid_core.utils.database.base_models import with_read_session, with_session
 from gsuid_core.utils.database.models import CoreUser, Subscribe
+from gsuid_core.utils.database.startup import exec_list
 from sqlalchemy import Column, Connection, Index, Text, func, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, col, select
+
+from .schema import DatabaseSchemaError
 
 
 def new_id() -> str:
@@ -129,7 +132,7 @@ class SynthesisRecord(SQLModel, table=True):
     error: str = Field(default="", max_length=160)
 
 
-# create_all 不给旧表补列；只在首次新增 subscribed 时开启现有账号的订阅。
+# 按 GS 官方流程注册补列；旧数据使用默认值，不要求回填历史账号关联。
 ADDED_COLUMNS = {
     "wt_account": {
         "subscribed": "BOOLEAN NOT NULL DEFAULT FALSE",
@@ -137,18 +140,36 @@ ADDED_COLUMNS = {
         "token_renew_after": "FLOAT NOT NULL DEFAULT 0",
         "token_state": "VARCHAR(32) NOT NULL DEFAULT 'ready'",
     },
-    "wt_chest_task": {"paused_at": "FLOAT"},
-    "wt_chest_record": {"notice_id": "VARCHAR(32) NOT NULL DEFAULT ''"},
+    "wt_chest_task": {"paused_at": "FLOAT DEFAULT NULL"},
+    # 已有记录不重新推送；新记录由模型显式写入空 notice_id。
+    "wt_chest_record": {"notice_id": "VARCHAR(32) NOT NULL DEFAULT 'legacy'"},
     "wt_notice": {
         "asset_id": "VARCHAR(32) NOT NULL DEFAULT ''",
         "rarity": "VARCHAR(32) NOT NULL DEFAULT ''",
         "record_ids": "TEXT NOT NULL DEFAULT ''",
-        "available_clicks": "BIGINT",
+        "available_clicks": "BIGINT DEFAULT NULL",
     },
 }
+exec_list.extend(
+    f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"
+    for table, columns in ADDED_COLUMNS.items()
+    for name, column_type in columns.items()
+)
+PLUGIN_TABLE_NAMES = (
+    "wt_account",
+    "wt_binding",
+    "wt_account_link",
+    "wt_chest_task",
+    "wt_chest_record",
+    "wt_notice",
+    "wt_synthesis_record",
+)
 
 
-def _add_missing_columns(connection: Connection) -> list[str]:
+def _ensure_schema(connection: Connection) -> list[str]:
+    tables = [SQLModel.metadata.tables[name] for name in PLUGIN_TABLE_NAMES]
+    # 启动前钩子可能被其他插件的异常跳过，补建仅本插件的表。
+    SQLModel.metadata.create_all(connection, tables=tables)
     added = []
     for table, columns in ADDED_COLUMNS.items():
         existing = {column["name"] for column in inspect(connection).get_columns(table)}
@@ -156,43 +177,25 @@ def _add_missing_columns(connection: Connection) -> list[str]:
             if name not in existing:
                 connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"))
                 added.append(f"{table}.{name}")
-    if "wt_account.subscribed" in added:
-        connection.execute(text("UPDATE wt_account SET subscribed = TRUE"))
-    if "wt_chest_record.notice_id" in added:
-        # 旧成功结果已有逐箱通知，不能在升级后再次汇总推送。
-        connection.execute(text("UPDATE wt_chest_record SET notice_id = 'legacy' WHERE state = 'success'"))
-    if "wt_chest_task.paused_at" in added:
-        now = time.time()
-        connection.execute(
-            text(
-                "UPDATE wt_chest_task SET paused_at=:now WHERE status='paused' "
-                + "AND pause_reason='manual' AND expires_at>:now"
-            ),
-            {"now": now},
-        )
-    if "wt_account.subscribed" in added:
-        # 只在旧版首次迁移时恢复关联，后续重启不能重新添加用户已删除的账号。
-        links = set(connection.execute(text("SELECT owner_id, account_id FROM wt_account_link")).all())
-        bindings = connection.execute(text("SELECT id, account_id FROM wt_binding")).all()
-        owners = {row[0] for row in bindings}
-        previous = connection.execute(text("SELECT owner_id, account_id FROM wt_chest_task")).all()
-        for owner_id, account_id in set(bindings + previous) - links:
-            if owner_id in owners:
-                connection.execute(
-                    text("INSERT INTO wt_account_link (owner_id, account_id) VALUES (:owner, :account)"),
-                    {"owner": owner_id, "account": account_id},
-                )
+    missing = []
+    inspector = inspect(connection)
+    for table in tables:
+        existing = {column["name"] for column in inspector.get_columns(table.name)}
+        missing.extend(f"{table.name}.{column.name}" for column in table.columns if column.name not in existing)
+    if missing:
+        raise DatabaseSchemaError(f"插件数据库缺少字段：{'、'.join(missing)}；后台任务不会启动。")
     # create_all 跳过已有表时也跳过新增索引，升级时单独创建。
     for index in SQLModel.metadata.tables["wt_chest_record"].indexes:
         index.create(connection, checkfirst=True)
     return added
 
 
-async def migrate_notice_columns() -> None:
+async def ensure_database_schema() -> None:
     async with base_models.engine.begin() as connection:
-        added = await connection.run_sync(_add_missing_columns)
+        added = await connection.run_sync(_ensure_schema)
     if added:
         logger.info(f"[WuwaTappoUID] 数据库迁移完成，新增字段：{'、'.join(added)}")
+    logger.info("[WuwaTappoUID] 数据库表结构校验通过。")
 
 
 class Store:

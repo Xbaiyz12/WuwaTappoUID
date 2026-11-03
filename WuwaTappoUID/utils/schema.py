@@ -68,6 +68,10 @@ class DataError(WuwaError):
     """响应数据不符合当前接口结构。"""
 
 
+class DatabaseSchemaError(WuwaError):
+    """插件表结构不完整，不能继续账号操作或恢复后台任务。"""
+
+
 class AuthenticationError(WuwaError):
     """登录态未确认，停止写操作；已取得的新 token 不回退或重复登录。"""
 
