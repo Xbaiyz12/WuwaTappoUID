@@ -4,7 +4,8 @@ import asyncio
 import hashlib
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
@@ -43,6 +44,14 @@ JSON = TypeAdapter(JsonValue)
 ITEMS = TypeAdapter(list[Item])
 RETRY_DELAYS = (1, 3, 5)
 RESOURCE_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=8, sock_read=12)
+CLICK_INTERVAL = 30
+CLICK_RATE_RETRIES = 3
+
+
+@dataclass
+class AccountRequests:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    finished_at: float = 0
 
 
 @dataclass
@@ -120,6 +129,39 @@ class WuwaAPI:
     def __init__(self) -> None:
         self.session: aiohttp.ClientSession | None = None
         self._versions: dict[str, int] = {}
+        self._requests: dict[str, AccountRequests] = {}
+
+    def account_requests(self, token: str = "", cuid: str = "") -> AccountRequests:
+        key = "cuid:" + cuid if cuid else "token:" + self._read_key(token)[0]
+        return self._requests.setdefault(key, AccountRequests())
+
+    def remember_account(self, token: str, cuid: str) -> None:
+        activity = self.account_requests(cuid=cuid)
+        key = "token:" + self._read_key(token)[0]
+        previous = self._requests.get(key)
+        if previous is not None:
+            activity.finished_at = max(activity.finished_at, previous.finished_at)
+        self._requests[key] = activity
+
+    @asynccontextmanager
+    async def account_request(
+        self, token: str = "", cuid: str = "", *, clicks: bool = False, expires_at: float | None = None
+    ) -> AsyncIterator[None]:
+        if not token and not cuid:
+            yield
+            return
+        activity = self.account_requests(token, cuid)
+        async with activity.lock:
+            if clicks:
+                delay = activity.finished_at + CLICK_INTERVAL - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                if expires_at is not None and time.time() >= expires_at:
+                    raise Expired
+            try:
+                yield
+            finally:
+                activity.finished_at = time.monotonic()
 
     def _read_key(self, token: str) -> tuple[str, int]:
         key = hashlib.sha256(token.encode()).hexdigest()
@@ -149,7 +191,9 @@ class WuwaAPI:
         self, url: str, method: str = "GET", payload: object = None, token: str = "", *, retry: bool = True
     ) -> Envelope:
         async def request() -> Envelope:
-            return await self._fetch_once(url, method, payload, token)
+            cuid = str(payload.get("cuid", "")) if isinstance(payload, dict) else ""
+            async with self.account_request(token, cuid):
+                return await self._fetch_once(url, method, payload, token)
 
         if retry:
             return await retry_network(request, "接口请求")
@@ -246,21 +290,24 @@ class WuwaAPI:
             raise
         return response.payload()
 
-    async def exchange_sdk_token(self, login: SdkLogin, role: RoleInfo, channel_id: int | str) -> LoginData:
+    async def exchange_sdk_token(
+        self, login: SdkLogin, role: RoleInfo | None, channel_id: int | str | None
+    ) -> LoginData:
         """仅显式网页登录使用真实 KrSDK 凭据；认证请求不自动重发。"""
         payload = {
             "cuid": login.cuid,
             "puid": login.sdk_openid,
-            "channelId": channel_id,
+            "channelId": channel_id if channel_id is not None else 0,
             "userid": login.sdk_openid,
             "cname": login.username,
             "accessToken": login.token,
             "source": "sdk",
-            "playerId": int(role.playerId),
-            "serverId": role.serverId,
+            "playerId": int(role.playerId) if role is not None else 0,
+            "serverId": role.serverId if role is not None else "0",
             "is_domestic": 1,
         }
         result = parse(LoginData, await self.request("/api/auth/login", payload=payload, retry=False))
+        self.remember_account(result.token, login.cuid)
         return result
 
     async def login_roles(self, cuid: str) -> RoleQuery:
@@ -291,6 +338,7 @@ class WuwaAPI:
         if not fresh and cache is not None and cache.active and key in cache.users:
             return cache.users[key]
         info = parse(UserInfo, await self.request("/api/frontend/user/me", "GET", token=token))
+        self.remember_account(token, str(info.cuid))
         if cache is not None and cache.active and key == self._read_key(token):
             cache.users[key] = info
         return info
@@ -341,15 +389,29 @@ class WuwaAPI:
     async def set_clicks(self, token: str, total: int, expires_at: float | None = None) -> int:
         """重连时仍提交同一个目标累计值；回读已达到目标就不再发送。"""
         attempted = False
+        rate_retries = 0
 
         async def submit() -> int:
-            nonlocal attempted
+            nonlocal attempted, rate_retries
             if attempted and (await self.me(token, fresh=True)).total_click_count >= total:
                 return 0
             if expires_at is not None and time.time() >= expires_at:
                 raise Expired
             attempted = True
-            return await self._set_clicks_once(token, total, expires_at)
+            while True:
+                try:
+                    async with self.account_request(token, clicks=True, expires_at=expires_at):
+                        code = await self._set_clicks_once(token, total, expires_at)
+                    if code == 80013:
+                        raise ApiError(code, path="/socket.io:cr")
+                    return code
+                except ApiError as error:
+                    if error.code != 80013 or rate_retries >= CLICK_RATE_RETRIES:
+                        raise
+                    rate_retries += 1
+                    logger.info(
+                        f"[WuwaTappoUID] 增加次数返回80013，等待30秒后重试（{rate_retries}/{CLICK_RATE_RETRIES}）。"
+                    )
 
         return await retry_network(submit, "点击连接")
 

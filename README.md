@@ -29,6 +29,8 @@ git clone https://github.com/gufei233/WuwaTappoUID.git gsuid_core/plugins/WuwaTa
 | `wt更新资源` | 更新名称与素材 |
 | `wt帮助` | 查看全部命令与说明 |
 
+手动及自动增加次数提交前，会与同账号上次实际网络请求间隔至少30秒；遇到80013按30秒间隔最多重试3次。没有鸣潮角色的库洛账号也支持 `wt登录`，显示“漂泊者”。
+
 主人在插件配置中填写 `login_public_url`（HTTPS域名）。默认使用 GsCore 登录页；关闭 `login_use_local` 后使用 [ww-login](https://github.com/gufei233/ww-login) 外置登录，GsCore 无需公网入口。配置方式见管理说明。CUID仅用于账号标识，不再支持凭CUID登录。请仅绑定本人或已获授权的账号，token 仅通过私聊添加。本地登录页会显示脱敏的绑定对象，请确认是本人账号。token过期暂停的有效任务在登录或添加token后自动恢复；已到期任务自动收尾汇总，手动暂停仍需 `wt恢复`。任务和通知会在重启后恢复。开箱汇总每页最多40件，多页合并转发。
 
 [帮助示例](docs/help.png) · [管理说明](docs/ADMIN.md) · [合成说明](docs/SYNTHESIS.md) · [更新记录](CHANGELOG.md)

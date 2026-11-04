@@ -139,8 +139,6 @@ class LoginManager:
                         ),
                         None,
                     )
-                    if role is None or roles.channelId is None:
-                        raise DataError("没有查询到有效的国服角色或渠道，请确认本人账号已有国服角色。")
                     target = account_id(sdk.cuid, 1)
                 else:
                     target = row.account_id
@@ -160,7 +158,9 @@ class LoginManager:
                         row.status = "verifying"
                         row.account_id = target
                         row.token_digest = session_key(token.token)
-                        row.result = json.dumps({"player_name": role.playerName}, ensure_ascii=False)
+                        row.result = json.dumps(
+                            {"player_name": role.playerName if role is not None else "漂泊者"}, ensure_ascii=False
+                        )
                         await Store.save(account, row)
                         # 先落盘新token；期限解析失败也不得丢弃它或重新交换。
                         account.token_expires_at = token_expiry(token.expire_time)
@@ -181,7 +181,7 @@ class LoginManager:
                     if (
                         str(info.cuid) != account.cuid
                         or (info.is_domestic is not None and info.is_domestic != 1)
-                        or str(info.server_id) != CN_SERVER_ID
+                        or str(info.server_id) not in ("0", CN_SERVER_ID)
                     ):
                         row.status = "failed"
                         raise DataError("登录结果的账号或区服不一致，本次未建立绑定。")
