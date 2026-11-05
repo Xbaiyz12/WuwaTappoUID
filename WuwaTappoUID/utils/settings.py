@@ -1,13 +1,25 @@
-"""GS 控制台中的重试上限。"""
+"""GS 控制台中的插件配置。"""
 
 from gsuid_core.data_store import get_res_path
 from gsuid_core.utils.plugins_config.gs_config import StringConfig
 from gsuid_core.utils.plugins_config.models import GsBoolConfig, GsIntConfig, GsStrConfig
 
+from .schema import WuwaError
+
 settings = StringConfig(
     "WuwaTappoUID",
     get_res_path("WuwaTappoUID") / "config.json",
     {
+        "max_click_increment": GsIntConfig(
+            title="单次增加次数上限",
+            desc="wt增加次数单次允许增加的最大值，须为正整数；保存后生效。自动补次数仍为每次10000。",
+            data=1_000_000,
+        ),
+        "chest_task_hours": GsIntConfig(
+            title="宝箱任务时长（小时）",
+            desc="wt宝箱新建任务及每次续期增加的小时数，须为正整数；已有任务到期时间不变。",
+            data=24,
+        ),
         "login_public_url": GsStrConfig(
             title="登录页面公网地址",
             desc="HTTPS 登录入口，如 https://login.example.com；本地模式反代 GsCore，外置模式填写 ww-login 地址。",
@@ -26,6 +38,21 @@ settings = StringConfig(
         ),
     },
 )
+
+
+def positive_int(key: str) -> int:
+    config = settings.get_config(key)
+    if config.data < 1:
+        raise WuwaError(f"后台插件配置“{config.title}”须为正整数，请主人修改后重试。")
+    return config.data
+
+
+def max_click_increment() -> int:
+    return positive_int("max_click_increment")
+
+
+def chest_task_hours() -> int:
+    return positive_int("chest_task_hours")
 
 
 def retry_limit() -> int:

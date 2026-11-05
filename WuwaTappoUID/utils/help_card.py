@@ -8,6 +8,7 @@ from gsuid_core.utils.fonts.fonts import core_font
 from PIL import Image, ImageDraw, ImageFont
 
 from .chest_card import BG, BROWN, SCALE, SOFT, asset, background, draw_text, paste_scaled, rounded_mask, s, shadow
+from .settings import chest_task_hours, max_click_increment
 
 # 图片与文字帮助共享指令和说明。
 COMMANDS: list[tuple[str, str, str]] = [
@@ -21,8 +22,8 @@ COMMANDS: list[tuple[str, str, str]] = [
     ("图鉴", "[角色/配件/表情]", "不带参数查看全部，可指定分类"),
     ("合成", "[同阶/升阶]", "每种留 1 件；默认升阶，可指定同阶"),
     ("次数", "", "查看累计、已消耗和可用点击"),
-    ("增加次数", "N", "增加 N 次点击，单次最多100万"),
-    ("宝箱", "", "开启24小时任务；剩余1小时可续期"),
+    ("增加次数", "N", "增加 N 次点击，单次最多{click_limit:,}"),
+    ("宝箱", "", "开启{task_hours}小时任务；剩余1小时可续期"),
     ("订阅", "", "10次后通知，中断或结束补发"),
     ("取消订阅", "", "任务结束汇总；中断仍发已有结果"),
     ("暂停", "", "暂停开箱和计时，恢复后继续"),
@@ -75,8 +76,13 @@ LEADING_PUNCT = "，。、；：！？）》」”’"
 UNIT = re.compile(r"[A-Za-z0-9]+|「[^」]{1,8}」|.", re.S)
 
 
+def commands() -> list[tuple[str, str, str]]:
+    limit, hours = max_click_increment(), chest_task_hours()
+    return [(name, arg, detail.format(click_limit=limit, task_hours=hours)) for name, arg, detail in COMMANDS]
+
+
 def help_text(prefix: str) -> str:
-    return "\n".join(f"{prefix}{name}{' ' + arg if arg else ''}：{detail}" for name, arg, detail in COMMANDS)
+    return "\n".join(f"{prefix}{name}{' ' + arg if arg else ''}：{detail}" for name, arg, detail in commands())
 
 
 def wrap(text: str, font: ImageFont.FreeTypeFont, width: int) -> list[str]:
@@ -124,7 +130,7 @@ def icon(canvas: Image.Image, asset_id: int, x: float, y: float) -> None:
 def render(prefix: str) -> Image.Image:
     details = core_font(s(DETAIL_SIZE), 430)
     detail_width = s(COLUMN_W - ROW_PAD * 2 - ICON_W - TEXT_GAP)
-    by_name = {name: (arg, detail) for name, arg, detail in COMMANDS}
+    by_name = {name: (arg, detail) for name, arg, detail in commands()}
     prepared = []
     cursor = 166
     for index, (title, names, color) in enumerate(GROUPS, 1):

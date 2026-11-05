@@ -14,10 +14,8 @@ TOKEN_LIFETIME = 7 * 24 * 3600
 TOKEN_RENEW_WINDOW = 2 * 24 * 3600
 TOKEN_RENEW_RETRY = 5 * 60
 TOKEN_EXPIRED_MESSAGE = "token已过期，请发送 wt登录，或使用 wt添加token TOKEN 更新。"
-TASK_SECONDS = 24 * 3600
 RENEW_WINDOW = 60 * 60
 AUTO_CLICKS = 10_000
-MAX_CLICK_INCREMENT = 1_000_000
 # 请求发出这么久后该侧冷却仍未推进，就判定那次开箱没有生效（HTTP 超时为 25 秒）。
 SETTLE_SECONDS = 120
 ASSET_MANIFEST_PATH = "/app/asset-json/appearance_asset.json"

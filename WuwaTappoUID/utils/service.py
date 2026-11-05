@@ -1,4 +1,4 @@
-"""账号锁、24 小时任务、开箱流水与通知提交。"""
+"""账号锁、定时宝箱任务、开箱流水与通知提交。"""
 
 import asyncio
 import hashlib
@@ -24,12 +24,10 @@ from .formatting import account_text, date_text, mask_cuid, role_text, task_text
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
-    MAX_CLICK_INCREMENT,
     NET_SERVER_IDS,
     RENEW_WINDOW,
     SETTLE_SECONDS,
     SIDE_NAMES,
-    TASK_SECONDS,
     TOKEN_EXPIRED_MESSAGE,
     TOKEN_LIFETIME,
     TOKEN_RENEW_RETRY,
@@ -47,7 +45,7 @@ from .schema import (
     UserInfo,
     WuwaError,
 )
-from .settings import retry_limit
+from .settings import chest_task_hours, max_click_increment, retry_limit
 from .synthesis import highest_tiers, next_recipe
 
 NOTICE_CACHE_BYTES = 32 * 1024 * 1024
@@ -279,7 +277,7 @@ class Service:
             return "宝箱任务保持暂停，可用 wt恢复 操作。"
         if task.remaining() <= 0:
             await self.finish(task, "expired", "本轮已到期")
-            return "宝箱任务已到期，请用 wt宝箱 开启新的24小时任务。"
+            return "宝箱任务已到期，请用 wt宝箱 开启新任务。"
         try:
             if not await self.reconcile(task, info):
                 return "登录成功，但任务尚未恢复：开箱结果仍待确认，可稍后用 wt恢复。"
@@ -287,7 +285,7 @@ class Service:
             return f"登录成功，但任务尚未恢复：{error}；可稍后用 wt恢复。"
         if task.remaining() <= 0:
             await self.finish(task, "expired", "本轮已到期")
-            return "宝箱任务已到期，请用 wt宝箱 开启新的24小时任务。"
+            return "宝箱任务已到期，请用 wt宝箱 开启新任务。"
         if task.paused_at is not None:
             task.expires_at += time.time() - task.paused_at
         task.paused_at = None
@@ -686,8 +684,9 @@ class Service:
         return after, delta, problem
 
     async def increase(self, event: Event, number: int) -> list[str | bytes]:
-        if not 1 <= number <= MAX_CLICK_INCREMENT:
-            raise WuwaError(f"单次增加次数须为 1～{MAX_CLICK_INCREMENT:,}，请核对输入。")
+        limit = max_click_increment()
+        if not 1 <= number <= limit:
+            raise WuwaError(f"单次增加次数须为 1～{limit:,}，请核对输入。")
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
@@ -750,6 +749,7 @@ class Service:
         return max(now + 0.1, min(candidates))
 
     async def start_or_renew(self, event: Event) -> list[str | bytes]:
+        hours = chest_task_hours()
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             binding, account = await self.bound(event)
             async with self.account_lock(account.id):
@@ -772,9 +772,9 @@ class Service:
                     else:
                         action = "任务正在运行。"
                     if 0 < task.remaining(now) <= RENEW_WINDOW:
-                        task.expires_at += TASK_SECONDS
+                        task.expires_at += hours * 3600
                         task.reminded = False
-                        action += "已在原到期时间上续期 24 小时。"
+                        action += f"已在原到期时间上续期 {hours} 小时。"
                     await Store.save(task)
                     self.schedule(task)
                 else:
@@ -798,12 +798,12 @@ class Service:
                         owner_id=binding.id,
                         subscription_id=subscriptions[0].id,
                         started_at=now,
-                        expires_at=now + TASK_SECONDS,
+                        expires_at=now + hours * 3600,
                         next_check=now,
                     )
                     await Store.save(task)
                     self.schedule(task)
-                    action = "已开启 24 小时自动开箱，将立即检查左右宝箱。"
+                    action = f"已开启 {hours} 小时自动开箱，将立即检查左右宝箱。"
                 answer = action
         await self.flush_notices()
         image = await self.cards.task_summary(account, task, event)
@@ -886,7 +886,7 @@ class Service:
                     raise WuwaError("任务属于另一用户，请由任务所属用户操作。")
                 if task.remaining() <= 0:
                     await self.finish(task, "expired", "本轮已到期")
-                    answer = "本轮已到期，请用 wt宝箱 开启新的24小时任务。"
+                    answer = "本轮已到期，请用 wt宝箱 开启新任务。"
                 elif paused and task.timer_paused:
                     answer = "任务和计时已经暂停。\n" + task_text(task)
                 elif not paused and task.status == "active":
@@ -1088,7 +1088,7 @@ class Service:
             interrupted = False
             try:
                 if task.remaining() <= 0:
-                    await self.finish(task, "expired", "24 小时自动开箱已结束")
+                    await self.finish(task, "expired", "本轮自动开箱已结束")
                     return
                 if task.status == "paused" and task.pause_reason == "auth":
                     return
@@ -1099,7 +1099,8 @@ class Service:
                         Notice(
                             subscription_id=task.subscription_id,
                             account_id=key,
-                            text="自动开箱剩余不超过 1 小时，可发送 wt宝箱 在原到期时间上续期 24 小时。"
+                            text="自动开箱剩余不超过 1 小时，可发送 wt宝箱"
+                            f" 在原到期时间上续期 {chest_task_hours()} 小时。"
                             f"\n到期：{date_text(task.expires_at)}",
                         ),
                     )
@@ -1135,7 +1136,7 @@ class Service:
                 await self.failures.success("check:" + key)
                 task.failures = 0
             except Expired:
-                await self.finish(task, "expired", "24 小时自动开箱已结束")
+                await self.finish(task, "expired", "本轮自动开箱已结束")
             except NetworkError as error:
                 # 每轮网络请求自身有有限重试；持续失败也有后台轮次上限。
                 await self.task_failure(task, error)
