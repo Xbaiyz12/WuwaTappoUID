@@ -4,6 +4,9 @@ from io import BytesIO
 
 from PIL import Image, ImageDraw
 
+from .chest_card import BG, footer, s
+from .chest_card import background as draw_background
+
 TILE = 320
 RADIUS = 28
 FIT = 256
@@ -42,6 +45,11 @@ def render_tile(raw: bytes, rarity: str) -> bytes:
     )
     tile.alpha_composite(sprite, ((TILE - sprite.width) // 2, (TILE - sprite.height) // 2))
 
+    canvas = Image.new("RGBA", (s(650), s(400)), BG + (255,))
+    draw_background(canvas, 650)
+    tile = tile.resize((s(TILE), s(TILE)), Image.Resampling.LANCZOS)
+    canvas.alpha_composite(tile, ((canvas.width - tile.width) // 2, s(16)))
+    footer(ImageDraw.Draw(canvas), 354, 650)
     out = BytesIO()
-    tile.save(out, format="PNG", optimize=True)
+    canvas.convert("RGB").save(out, format="PNG", optimize=True)
     return out.getvalue()

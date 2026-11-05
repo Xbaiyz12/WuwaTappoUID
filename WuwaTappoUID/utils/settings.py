@@ -10,6 +10,11 @@ settings = StringConfig(
     "WuwaTappoUID",
     get_res_path("WuwaTappoUID") / "config.json",
     {
+        "bot_name": GsStrConfig(
+            title="图片页脚 Bot 名称",
+            desc="所有图片页脚中 Bot：后显示的名称，保存后新生成的图片立即生效。",
+            data="飞行雪绒",
+        ),
         "max_click_increment": GsIntConfig(
             title="单次增加次数上限",
             desc="wt增加次数单次允许增加的最大值，须为正整数；保存后生效。自动补次数仍为每次10000。",
@@ -45,6 +50,10 @@ def positive_int(key: str) -> int:
     if config.data < 1:
         raise WuwaError(f"后台插件配置“{config.title}”须为正整数，请主人修改后重试。")
     return config.data
+
+
+def bot_name() -> str:
+    return settings.get_config("bot_name").data
 
 
 def max_click_increment() -> int:

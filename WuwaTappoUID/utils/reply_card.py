@@ -21,12 +21,14 @@ from .chest_card import (
     fit,
     header,
     heading,
-    misans,
     rounded_mask,
     runs,
     s,
     shadow,
     width_of,
+)
+from .chest_card import (
+    footer as draw_footer,
 )
 from .schema import RoleInfo, UserInfo
 
@@ -142,11 +144,7 @@ def base(info: Header, title: str, height: float) -> tuple[Image.Image, ImageDra
 
 def footer(draw: ImageDraw.ImageDraw, y: float) -> None:
     rule(draw, 36, y - 10, 864, y - 10)
-    parts = (("Powered by ", 430), ("GsCore", 700), ("  Bot：", 430), ("飞行雪绒", 630))
-    total = sum(misans(13, weight).getlength(value) for value, weight in parts) / SCALE
-    x = (900 - total) / 2
-    for value, weight in parts:
-        x = text(draw, x, y, value, 13, BROWN if weight >= 630 else SOFT, line=26, weight=weight, rounded=False)
+    draw_footer(draw, y)
 
 
 def finish(canvas: Image.Image) -> bytes:

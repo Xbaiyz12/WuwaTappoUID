@@ -2,6 +2,10 @@
 
 `wt状态`、`wt强制更新资源` 仅限 Bot 主人或超级用户使用。
 
+## 图片页脚
+
+所有输出图片使用 `Powered by GsCore & Created By WuwaTappoUID Bot：飞行雪绒` 页脚。在 GsCore 后台的 `WuwaTappoUID` 插件配置中修改 **图片页脚 Bot 名称**（`bot_name`），即可替换 `Bot：` 后的名称，默认“飞行雪绒”。保存后新生成的图片及重新发送的缓存通知使用新名称，无需重启。
+
 ## 次数上限与任务时长
 
 在 GsCore 后台的插件配置中选择 `WuwaTappoUID`：

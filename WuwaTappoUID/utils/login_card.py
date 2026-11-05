@@ -5,11 +5,11 @@ import io
 import qrcode
 from PIL import Image, ImageDraw
 
-from .chest_card import ACCENT, BG, BROWN, SOFT, background, draw_text, paste_asset, s
+from .chest_card import ACCENT, BG, BROWN, SOFT, background, draw_text, footer, paste_asset, s
 
 
 def render_login(url: str) -> bytes:
-    canvas = Image.new("RGBA", (s(650), s(710)), BG)
+    canvas = Image.new("RGBA", (s(650), s(754)), BG)
     background(canvas, 650)
     draw = ImageDraw.Draw(canvas)
     paste_asset(canvas, "logo.webp", 36, 30, 196)
@@ -25,6 +25,7 @@ def render_login(url: str) -> bytes:
     tile = tile.resize((s(364), s(364)), Image.Resampling.NEAREST)
     canvas.alpha_composite(tile, (s(143), s(237)))
     draw_text(draw, 36, 641, 32, "5分钟内有效 · 请勿转发登录链接", 22, ACCENT, rounded=False)
+    footer(draw, 700, 650)
     output = io.BytesIO()
     canvas.convert("RGB").save(output, "PNG")
     return output.getvalue()

@@ -16,6 +16,8 @@ from pathlib import Path
 from gsuid_core.utils.fonts.fonts import core_font
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from .settings import bot_name
+
 ASSETS = Path(__file__).parent.parent / "assets" / "tappo"
 SCALE = 1.5
 WIDTH = 900
@@ -436,6 +438,25 @@ def progress_box(
             canvas.alpha_composite(bar, (s(x), s(bar_y)))
 
 
+def footer(draw: ImageDraw.ImageDraw, y: float, width: float = WIDTH) -> None:
+    parts = (
+        ("Powered by ", 430),
+        ("GsCore", 700),
+        (" & Created By ", 430),
+        ("WuwaTappoUID", 700),
+        (" Bot：", 430),
+        (bot_name(), 630),
+    )
+    size = 13
+    total = sum(misans(size, weight).getlength(value) for value, weight in parts) / SCALE
+    while total > width - PAD_X * 2 and size > 8:
+        size -= 1
+        total = sum(misans(size, weight).getlength(value) for value, weight in parts) / SCALE
+    x = (width - total) / 2
+    for value, weight in parts:
+        x = draw_text(draw, x, y, 26, value, size, BROWN if weight >= 630 else SOFT, rounded=False, weight=weight)
+
+
 def render_chest_card(
     info: Header, title: str, cards: list[Card], note: str = "", progress: list[Progress] | None = None
 ) -> bytes:
@@ -450,7 +471,8 @@ def render_chest_card(
     grid_top = section_top + 6
     grid_bottom = grid_top + rows * CARD_H + (rows - 1) * GAP_Y
     progress_top = grid_bottom + 22
-    bottom = (progress_top + 75 if progress else grid_bottom) + PAD_BOTTOM
+    footer_top = (progress_top + 75 if progress else grid_bottom) + 22
+    bottom = footer_top + 26 + PAD_BOTTOM
 
     canvas = Image.new("RGBA", (s(WIDTH), s(bottom)), BG + (255,))
     background(canvas)
@@ -467,6 +489,7 @@ def render_chest_card(
         card(canvas, draw, left + col * (CARD + GAP_X), grid_top + row * (CARD_H + GAP_Y), item)
     if progress:
         progress_box(canvas, draw, progress_top, progress)
+    footer(draw, footer_top)
     output = io.BytesIO()
     canvas.convert("RGB").save(output, "JPEG", quality=90, optimize=True)
     return output.getvalue()

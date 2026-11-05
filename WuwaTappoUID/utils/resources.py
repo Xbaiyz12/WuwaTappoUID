@@ -21,7 +21,7 @@ from .schema import (
     Item,
     WuwaError,
 )
-from .settings import retry_limit
+from .settings import bot_name, retry_limit
 
 DEFAULT_HOST = "https://mc-wuwatappo.kurogames-global.com"
 CacheModel = TypeVar("CacheModel", bound=BaseModel)
@@ -347,7 +347,7 @@ class Resources:
         try:
             raw = await asyncio.to_thread(path.read_bytes)
             # 内容参与缓存键，强制覆盖同一个 URL 后也会重新绘制通知图。
-            key = hashlib.sha256(raw + rarity.encode()).hexdigest()
+            key = hashlib.sha256(raw + rarity.encode() + b"footer-v1" + bot_name().encode()).hexdigest()
             cached = self.image_dir / f"{key}.png"
             async with self._image_locks.setdefault(key, asyncio.Lock()):
                 if cached.exists():

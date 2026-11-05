@@ -18,19 +18,21 @@ from ..runtime import login, resources, service
 from ..utils.api import with_read_cache
 from ..utils.help_card import help_text, render
 from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
+from ..utils.settings import bot_name, chest_task_hours, max_click_increment
 
 sv = SV("WuwaTappo账号与宝箱", pm=6)
 register_help("WuwaTappoUID", f"{get_plugin_available_prefix('WuwaTappoUID')}帮助")
 
-# 帮助图按前缀缓存：内容固定，管理员改了插件前缀才需要重画。
-_help_images: dict[str, bytes] = {}
+# 前缀、说明或页脚配置变化后重新绘制帮助图。
+_help_images: dict[tuple[str, int, int, str], bytes] = {}
 
 
 async def help_image() -> bytes:
     prefix = get_plugin_available_prefix("WuwaTappoUID")
-    if prefix not in _help_images:
-        _help_images[prefix] = await convert_img(await asyncio.to_thread(render, prefix))
-    return _help_images[prefix]
+    key = (prefix, max_click_increment(), chest_task_hours(), bot_name())
+    if key not in _help_images:
+        _help_images[key] = await convert_img(await asyncio.to_thread(render, prefix))
+    return _help_images[key]
 
 
 COMMANDS = (

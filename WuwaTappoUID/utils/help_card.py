@@ -7,7 +7,7 @@ from pathlib import Path
 from gsuid_core.utils.fonts.fonts import core_font
 from PIL import Image, ImageDraw, ImageFont
 
-from .chest_card import BG, BROWN, SCALE, SOFT, asset, background, draw_text, paste_scaled, rounded_mask, s, shadow
+from .chest_card import BG, BROWN, SOFT, asset, background, draw_text, footer, paste_scaled, rounded_mask, s, shadow
 from .settings import chest_task_hours, max_click_increment
 
 # 图片与文字帮助共享指令和说明。
@@ -186,11 +186,5 @@ def render(prefix: str) -> Image.Image:
                     draw_text(draw, text_x, text_y, DETAIL_STEP, line, DETAIL_SIZE, SOFT, rounded=False, weight=430)
                     text_y += DETAIL_STEP
 
-    # 参考 XWUID footer：居中的透明底署名，小字与品牌名组合。
-    footer_y = cursor + 8
-    parts = (("Powered by ", 430), ("GsCore", 700), ("  Bot：", 430), ("飞行雪绒", 630))
-    total = sum(core_font(s(13), weight).getlength(text) for text, weight in parts) / SCALE
-    x = (WIDTH - total) / 2
-    for text, weight in parts:
-        x = draw_text(draw, x, footer_y, 26, text, 13, BROWN if weight >= 630 else SOFT, rounded=False, weight=weight)
+    footer(draw, cursor + 8, WIDTH)
     return canvas.convert("RGB")

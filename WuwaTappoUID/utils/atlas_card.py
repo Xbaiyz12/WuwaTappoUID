@@ -17,6 +17,7 @@ from .chest_card import (
     background,
     draw_text,
     ellipsize,
+    footer,
     header,
     heading,
     prepared_sprite,
@@ -108,7 +109,8 @@ def render_atlas_card(
         cursor += 36 + math.ceil(len(group.items) / columns) * ROW_H + 18
     if not groups:
         cursor += 70
-    height = cursor + 24
+    footer_top = cursor + 8
+    height = footer_top + 26 + 24
     canvas = Image.new("RGBA", (s(width), s(height)), BG + (255,))
     background(canvas, width)
     draw = ImageDraw.Draw(canvas)
@@ -132,6 +134,7 @@ def render_atlas_card(
             row, col = divmod(index, columns)
             draw_tile(canvas, draw, item, 36 + col * CELL_W, grid_top + row * ROW_H)
         cursor = grid_top + math.ceil(len(group.items) / columns) * ROW_H + 18
+    footer(draw, footer_top, width)
     output = io.BytesIO()
     canvas.convert("RGB").save(output, "JPEG", quality=90, optimize=True)
     return output.getvalue()

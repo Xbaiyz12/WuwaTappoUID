@@ -45,7 +45,7 @@ from .schema import (
     UserInfo,
     WuwaError,
 )
-from .settings import chest_task_hours, max_click_increment, retry_limit
+from .settings import bot_name, chest_task_hours, max_click_increment, retry_limit
 from .synthesis import highest_tiers, next_recipe
 
 NOTICE_CACHE_BYTES = 32 * 1024 * 1024
@@ -54,6 +54,7 @@ NOTICE_CACHE_BYTES = 32 * 1024 * 1024
 @dataclass
 class CachedNoticeImage:
     revision: int
+    bot_name: str
     body: tuple[bytes, ...]
 
 
@@ -1315,13 +1316,13 @@ class Service:
         if key not in self._notice_images:
             return None
         cached = self._notice_images[key]
-        if cached.revision != self.resources.revision:
+        if cached.revision != self.resources.revision or cached.bot_name != bot_name():
             self.release_notice_image(key)
             return None
         self._notice_images.move_to_end(key)
         return cached.body
 
-    def cache_notice_image(self, key: str, revision: int, body: tuple[bytes, ...]) -> None:
+    def cache_notice_image(self, key: str, revision: int, name: str, body: tuple[bytes, ...]) -> None:
         self.release_notice_image(key)
         size = sum(map(len, body))
         if size > NOTICE_CACHE_BYTES:
@@ -1329,7 +1330,7 @@ class Service:
         while self._notice_images and self._notice_image_bytes + size > NOTICE_CACHE_BYTES:
             _, old = self._notice_images.popitem(last=False)
             self._notice_image_bytes -= sum(map(len, old.body))
-        self._notice_images[key] = CachedNoticeImage(revision, body)
+        self._notice_images[key] = CachedNoticeImage(revision, name, body)
         self._notice_image_bytes += size
 
     async def notice_messages(
@@ -1342,11 +1343,12 @@ class Service:
             rendered = self.cached_notice_image(notice.id)
             if rendered is None:
                 revision = self.resources.revision
+                name = bot_name()
                 if account.id not in contexts:
                     contexts[account.id] = await self.cards.result_context(account, event)
                 records = await Store.records(json.loads(notice.record_ids))
                 rendered = await self.cards.results(records, notice.available_clicks, notice_text, contexts[account.id])
-                self.cache_notice_image(notice.id, revision, rendered)
+                self.cache_notice_image(notice.id, revision, name, rendered)
             return [MessageSegment.image(page) for page in rendered]
         label = f"CUID {mask_cuid(account.cuid)}：\n" if account is not None else ""
         messages = [MessageSegment.text(label + notice_text + "\n")]
