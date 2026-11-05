@@ -4,8 +4,8 @@ from io import BytesIO
 
 from PIL import Image, ImageDraw
 
-from .chest_card import BG, footer, s
-from .chest_card import background as draw_background
+from .render_common import BG, footer, s
+from .render_common import background as draw_background
 
 TILE = 320
 RADIUS = 28
@@ -24,7 +24,8 @@ RARITY_COLORS: dict[str, tuple[tuple[int, int, int], tuple[int, int, int], tuple
 
 def render_tile(raw: bytes, rarity: str) -> bytes:
     top, bottom, border = RARITY_COLORS.get(rarity.strip().lower(), RARITY_COLORS["common"])
-    sprite = Image.open(BytesIO(raw)).convert("RGBA")
+    with Image.open(BytesIO(raw)) as image:
+        sprite = image.convert("RGBA")
     box = sprite.getchannel("A").getbbox()
     if box is not None:
         sprite = sprite.crop(box)

@@ -5,7 +5,7 @@ import io
 import qrcode
 from PIL import Image, ImageDraw
 
-from .chest_card import ACCENT, BG, BROWN, SOFT, background, draw_text, footer, paste_asset, s
+from .render_common import ACCENT, BG, BROWN, SOFT, background, draw_text, footer, paste_asset, s
 
 
 def render_login(url: str) -> bytes:

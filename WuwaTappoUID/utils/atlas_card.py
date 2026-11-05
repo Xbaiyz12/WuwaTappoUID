@@ -7,7 +7,8 @@ from functools import cache
 
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageOps
 
-from .chest_card import (
+from .render_cache import LocalImage, images
+from .render_common import (
     BG,
     BROWN,
     SOFT,
@@ -15,11 +16,13 @@ from .chest_card import (
     Progress,
     asset,
     background,
+    composite,
     draw_text,
     ellipsize,
     footer,
     header,
     heading,
+    image_key,
     prepared_sprite,
     progress_box,
     s,
@@ -41,7 +44,7 @@ DOT_COLORS = {
 class AtlasItem:
     name: str
     rarity: str
-    image: bytes | None
+    image: bytes | LocalImage | None
     quantity: int = 0
 
 
@@ -63,22 +66,36 @@ def tile_mask() -> Image.Image:
     return asset("tile_mask.png").getchannel("A").resize((s(86), s(76)), Image.Resampling.LANCZOS)
 
 
-def draw_tile(canvas: Image.Image, draw: ImageDraw.ImageDraw, item: AtlasItem, x: float, y: float) -> None:
-    rarity = item.rarity if item.rarity in RARITIES else "common"
+def composed_tile(item: AtlasItem, rarity: str) -> Image.Image:
+    key = ("tile", image_key(item.image) if item.image is not None else None, s(86), s(76), rarity, item.quantity > 0)
+    cached = images.get(key)
+    if cached is not None:
+        return cached
     tile = tile_background(rarity).copy()
     if item.image:
         try:
-            picture = prepared_sprite(item.image, s(92), s(92))
-            tile.alpha_composite(picture, ((tile.width - picture.width) // 2, s(-4) + (s(92) - picture.height) // 2))
+            # 图鉴保留最终小图即可，避免中间缩放图与最终图重复占用预算。
+            with prepared_sprite(item.image, s(92), s(92), retain=False) as picture:
+                tile.alpha_composite(
+                    picture, ((tile.width - picture.width) // 2, s(-4) + (s(92) - picture.height) // 2)
+                )
         except OSError:
             pass
     tile.putalpha(ImageChops.multiply(tile.getchannel("A"), tile_mask()))
     if item.quantity == 0:
         gray = ImageOps.grayscale(tile).convert("RGBA")
         gray.putalpha(tile.getchannel("A"))
+        tile.close()
         tile = ImageEnhance.Brightness(gray).enhance(1.12)
+        gray.close()
         tile.putalpha(tile.getchannel("A").point(lambda alpha: round(alpha * 0.38)))
-    canvas.alpha_composite(tile, (s(x + 4), s(y)))
+    return images.put(key, tile)
+
+
+def draw_tile(canvas: Image.Image, draw: ImageDraw.ImageDraw, item: AtlasItem, x: float, y: float) -> None:
+    rarity = item.rarity if item.rarity in RARITIES else "common"
+    tile = composed_tile(item, rarity)
+    composite(canvas, tile, (s(x + 4), s(y)))
 
     head, _, tail = item.name.partition(" · ")
     name_color = BROWN if item.quantity else (201, 183, 164)
@@ -111,7 +128,7 @@ def render_atlas_card(
         cursor += 70
     footer_top = cursor + 8
     height = footer_top + 26 + 24
-    canvas = Image.new("RGBA", (s(width), s(height)), BG + (255,))
+    canvas = Image.new("RGB", (s(width), s(height)), BG)
     background(canvas, width)
     draw = ImageDraw.Draw(canvas)
     header(canvas, draw, info, width)
@@ -136,5 +153,6 @@ def render_atlas_card(
         cursor = grid_top + math.ceil(len(group.items) / columns) * ROW_H + 18
     footer(draw, footer_top, width)
     output = io.BytesIO()
-    canvas.convert("RGB").save(output, "JPEG", quality=90, optimize=True)
+    canvas.save(output, "JPEG", quality=90, optimize=True)
+    canvas.close()
     return output.getvalue()

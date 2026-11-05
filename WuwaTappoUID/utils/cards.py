@@ -13,9 +13,11 @@ from pydantic import BaseModel
 from .api import WuwaAPI
 from .atlas_card import RARITIES as ATLAS_RARITIES
 from .atlas_card import AtlasGroup, AtlasItem, render_atlas_card
-from .chest_card import Card, Header, Progress, render_chest_card
+from .chest_card import Card, render_chest_card
 from .database import Account, ChestRecord, ChestTask, Store
 from .formatting import mask_cuid
+from .render_cache import LocalImage, render_in_thread
+from .render_common import Header, Progress
 from .reply_card import TaskSnapshot, render_account, render_clicks, render_task
 from .resources import Resources
 from .schema import ApiError, Item, NetworkError, OpenResult, RoleInfo, SynthesisResult, UserInfo, WuwaError
@@ -54,8 +56,6 @@ class Cards:
         self._catalog_rarities: dict[tuple[str, str], list[CatalogEntry]] = {}
         self._uids: dict[str, tuple[float, str]] = {}
         self._avatars: dict[str, tuple[float, bytes]] = {}
-        # Pillow 字体/素材有共享缓存，绘图顺序执行，不阻塞 GS 事件循环。
-        self._draw_lock = asyncio.Lock()
 
     def _refresh_catalog(self) -> None:
         live = self.resources.catalog
@@ -113,7 +113,7 @@ class Cards:
     def _read_images(paths: dict[str, Path]) -> dict[str, bytes]:
         return {key: path.read_bytes() for key, path in paths.items() if path.exists()}
 
-    async def item_cards(self, items: list[Item]) -> list[Card]:
+    async def item_cards(self, items: list[Item], *, lazy: bool = False) -> list[Card]:
         catalog = self.catalog
         manifest = self.resources.manifest
         paths: dict[str, Path] = {}
@@ -130,6 +130,11 @@ class Cards:
                 relative = manifest.lookup(key)
                 if relative:
                     paths[key] = self.resources._raw_path(self.resources._image_url(relative))
+        if lazy:
+            for item, card in zip(items, cards, strict=True):
+                path = paths.get(str(item.asset_id))
+                card.image = LocalImage(path, self.resources.revision) if path is not None else None
+            return cards
         # 一批图片只进入一次线程池；同批重复物品共用一次文件读取。
         images = await asyncio.to_thread(self._read_images, paths) if paths else {}
         for item, card in zip(items, cards, strict=True):
@@ -197,8 +202,7 @@ class Cards:
     async def draw(
         self, header: Header, title: str, cards: list[Card], note: str, progress: list[Progress] | None = None
     ) -> bytes:
-        async with self._draw_lock:
-            return await asyncio.to_thread(render_chest_card, header, title, cards, note, progress)
+        return await render_in_thread(render_chest_card, header, title, cards, note, progress)
 
     @staticmethod
     def task_snapshot(task: ChestTask, subscribed: bool) -> TaskSnapshot:
@@ -240,19 +244,18 @@ class Cards:
         snapshot = self.task_snapshot(task, account.subscribed) if task is not None else None
         profile = await self.header(account, None, event)
         desktop_avatar = await self.desktop_avatar(account, info)
-        async with self._draw_lock:
-            return await asyncio.to_thread(
-                render_account,
-                profile,
-                info,
-                mask_cuid(account.cuid),
-                account.domestic,
-                roles,
-                role_note,
-                snapshot,
-                account.subscribed,
-                desktop_avatar,
-            )
+        return await render_in_thread(
+            render_account,
+            profile,
+            info,
+            mask_cuid(account.cuid),
+            account.domestic,
+            roles,
+            role_note,
+            snapshot,
+            account.subscribed,
+            desktop_avatar,
+        )
 
     async def click_summary(
         self,
@@ -263,20 +266,18 @@ class Cards:
     ) -> bytes:
         info = UserInfo.model_validate_json(account.info)
         profile = await self.header(account, None, event)
-        async with self._draw_lock:
-            return await asyncio.to_thread(
-                render_clicks,
-                profile,
-                info,
-                requested,
-                delta,
-            )
+        return await render_in_thread(
+            render_clicks,
+            profile,
+            info,
+            requested,
+            delta,
+        )
 
     async def task_summary(self, account: Account, task: ChestTask, event: Event) -> bytes:
         snapshot = self.task_snapshot(task, account.subscribed)
         profile = await self.header(account, None, event)
-        async with self._draw_lock:
-            return await asyncio.to_thread(render_task, profile, snapshot)
+        return await render_in_thread(render_task, profile, snapshot)
 
     async def result_context(self, account: Account, event: Event) -> ResultContext:
         progress = None
@@ -336,7 +337,7 @@ class Cards:
         for kind, entries in groups.items():
             cards = [
                 AtlasItem(card.name, card.rarity, card.image, item.quantity)
-                for item, card in zip(entries, await self.item_cards(entries), strict=True)
+                for item, card in zip(entries, await self.item_cards(entries, lazy=True), strict=True)
             ]
             cards.sort(
                 key=lambda card: (ATLAS_RARITIES.index(card.rarity) if card.rarity in ATLAS_RARITIES else 4, card.name)
@@ -366,8 +367,7 @@ class Cards:
     async def draw_atlas(
         self, header: Header, title: str, groups: list[AtlasGroup], progress: list[Progress], note: str = ""
     ) -> bytes:
-        async with self._draw_lock:
-            return await asyncio.to_thread(render_atlas_card, header, title, groups, progress, note)
+        return await render_in_thread(render_atlas_card, header, title, groups, progress, note)
 
     async def atlas(self, account: Account, items: list[Item], event: Event, kind: str | None = None) -> list[bytes]:
         quantities = {str(item.asset_id): item.quantity for item in items}
@@ -384,7 +384,7 @@ class Cards:
     ) -> bytes:
         entries = self.catalog_group(kind)
         loaded = await self.item_cards(
-            [Item(asset_id=entry.asset, asset_type=kind, rarity=entry.rarity) for entry in entries]
+            [Item(asset_id=entry.asset, asset_type=kind, rarity=entry.rarity) for entry in entries], lazy=True
         )
         groups = []
         for rarity in ATLAS_RARITIES:

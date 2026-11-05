@@ -1,5 +1,6 @@
 """wt帮助：背包同款底图，分类栏目与史诗角色指令图标。"""
 
+import io
 import re
 from functools import cache
 from pathlib import Path
@@ -7,7 +8,8 @@ from pathlib import Path
 from gsuid_core.utils.fonts.fonts import core_font
 from PIL import Image, ImageDraw, ImageFont
 
-from .chest_card import BG, BROWN, SOFT, asset, background, draw_text, footer, paste_scaled, rounded_mask, s, shadow
+from .render_cache import current_config
+from .render_common import BG, BROWN, SOFT, asset, background, draw_text, footer, paste_scaled, rounded_mask, s, shadow
 from .settings import chest_task_hours, max_click_increment
 
 # 图片与文字帮助共享指令和说明。
@@ -77,7 +79,10 @@ UNIT = re.compile(r"[A-Za-z0-9]+|「[^」]{1,8}」|.", re.S)
 
 
 def commands() -> list[tuple[str, str, str]]:
-    limit, hours = max_click_increment(), chest_task_hours()
+    config = current_config.get()
+    limit, hours = (
+        (config.click_limit, config.task_hours) if config is not None else (max_click_increment(), chest_task_hours())
+    )
     return [(name, arg, detail.format(click_limit=limit, task_hours=hours)) for name, arg, detail in COMMANDS]
 
 
@@ -101,7 +106,8 @@ def wrap(text: str, font: ImageFont.FreeTypeFont, width: int) -> list[str]:
 @cache
 def command_icon(asset_id: int) -> Image.Image:
     path = ICON_ROOT / f"{asset_id}.png"
-    return Image.open(path).convert("RGBA")
+    with Image.open(path) as image:
+        return image.convert("RGBA")
 
 
 def panel(canvas: Image.Image, x: float, y: float, width: float, height: float) -> None:
@@ -188,3 +194,12 @@ def render(prefix: str) -> Image.Image:
 
     footer(draw, cursor + 8, WIDTH)
     return canvas.convert("RGB")
+
+
+def render_bytes(prefix: str) -> bytes:
+    from gsuid_core.utils.image.convert import pic_quality
+
+    with render(prefix) as image:
+        output = io.BytesIO()
+        image.save(output, "JPEG", quality=pic_quality)
+        return output.getvalue()

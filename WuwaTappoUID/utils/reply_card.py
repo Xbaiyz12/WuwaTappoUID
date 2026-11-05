@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from PIL import Image, ImageDraw
 
-from .chest_card import (
+from .render_common import (
     ACCENT,
     BG,
     BROWN,
@@ -27,7 +27,7 @@ from .chest_card import (
     shadow,
     width_of,
 )
-from .chest_card import (
+from .render_common import (
     footer as draw_footer,
 )
 from .schema import RoleInfo, UserInfo
@@ -179,9 +179,9 @@ def render_account(
     canvas, draw = base(profile, "账号信息", 757 + extra)
     panel(canvas, 36, 222, 828, 94 + extra)
     if desktop_avatar is not None:
-        picture = Image.open(io.BytesIO(desktop_avatar)).convert("RGBA")
-        icon = fit(picture.crop(picture.getbbox()), s(76), s(76))
-        canvas.alpha_composite(icon, (s(60) + (s(76) - icon.width) // 2, s(231) + (s(76) - icon.height) // 2))
+        with Image.open(io.BytesIO(desktop_avatar)) as opened, opened.convert("RGBA") as picture:
+            with picture.crop(picture.getbbox()) as cropped, fit(cropped, s(76), s(76)) as icon:
+                canvas.alpha_composite(icon, (s(60) + (s(76) - icon.width) // 2, s(231) + (s(76) - icon.height) // 2))
     else:
         text(draw, 98, 256, "头像暂不可用" if info.character is not None else "未设置", 13, SOFT, align="center")
     if roles:

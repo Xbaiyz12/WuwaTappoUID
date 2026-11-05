@@ -18,6 +18,7 @@ from . import login_remote
 from .database import Account, AccountLink, Binding, LoginSession, Notice, Store
 from .formatting import mask_cuid
 from .login_card import render_login
+from .render_cache import render_in_thread
 from .schema import CN_SERVER_ID, ApiError, DataError, SdkLogin, WuwaError, token_expiry
 from .service import Service, account_id, identity
 from .settings import settings
@@ -74,7 +75,7 @@ class LoginManager:
             await Store.save(*opened, row)
         url = base + "/wuwatappouid/login#state=" + state
         try:
-            card = await asyncio.to_thread(render_login, url)
+            card = await render_in_thread(render_login, url)
         except Exception:
             logger.exception("[WuwaTappoUID] 登录二维码绘制失败，发送文字链接")
             return ["请在5分钟内打开链接登录本人国服账号，请勿转发。\n" + url]

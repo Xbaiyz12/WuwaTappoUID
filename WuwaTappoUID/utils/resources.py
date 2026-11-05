@@ -11,6 +11,7 @@ from pydantic import BaseModel, ValidationError
 
 from .api import JSON, Download, WuwaAPI, parse
 from .item_image import render_tile
+from .render_cache import RenderConfig, render_in_thread
 from .schema import (
     ASSET_MANIFEST_PATH,
     AssetEntry,
@@ -21,7 +22,7 @@ from .schema import (
     Item,
     WuwaError,
 )
-from .settings import bot_name, retry_limit
+from .settings import retry_limit
 
 DEFAULT_HOST = "https://mc-wuwatappo.kurogames-global.com"
 CacheModel = TypeVar("CacheModel", bound=BaseModel)
@@ -347,12 +348,13 @@ class Resources:
         try:
             raw = await asyncio.to_thread(path.read_bytes)
             # 内容参与缓存键，强制覆盖同一个 URL 后也会重新绘制通知图。
-            key = hashlib.sha256(raw + rarity.encode() + b"footer-v1" + bot_name().encode()).hexdigest()
+            config = RenderConfig.capture()
+            key = hashlib.sha256(raw + rarity.encode() + b"footer-v1" + config.bot_name.encode()).hexdigest()
             cached = self.image_dir / f"{key}.png"
             async with self._image_locks.setdefault(key, asyncio.Lock()):
                 if cached.exists():
                     return await asyncio.to_thread(cached.read_bytes)
-                tile = await asyncio.to_thread(render_tile, raw, rarity)
+                tile = await render_in_thread(render_tile, raw, rarity, config=config)
                 await asyncio.to_thread(self._write_file, cached, tile)
                 return tile
         except (OSError, ValueError):
