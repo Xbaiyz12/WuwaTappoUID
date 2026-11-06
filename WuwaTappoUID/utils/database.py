@@ -84,6 +84,7 @@ class LoginSession(SQLModel, table=True):
     token_digest: str = Field(default="", max_length=64, repr=False)
     message: str = Field(default="", sa_column=Column(Text, nullable=False))
     result: str = Field(default="{}", sa_column=Column(Text, nullable=False))
+    submission: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
 
     external_url: str = Field(default="", sa_column=Column(Text, nullable=False))
     external_state: str = Field(default="", max_length=128, repr=False)
@@ -175,6 +176,7 @@ class SynthesisRecord(SQLModel, table=True):
 # 按 GS 官方流程注册补列；旧数据使用默认值，不要求回填历史账号关联。
 ADDED_COLUMNS = {
     "wt_login_session": {
+        "submission": "TEXT NOT NULL DEFAULT ''",
         "external_url": "TEXT NOT NULL DEFAULT ''",
         "external_state": "VARCHAR(128) NOT NULL DEFAULT ''",
         "external_poll_token": "VARCHAR(128) NOT NULL DEFAULT ''",
@@ -279,6 +281,12 @@ class Store:
         return list((await session.execute(query)).scalars().all())
 
     @classmethod
+    @with_read_session
+    async def local_logins(cls, session: AsyncSession) -> list[LoginSession]:
+        query = select(LoginSession).where(col(LoginSession.external_url) == "", col(LoginSession.submission) != "")
+        return list((await session.execute(query)).scalars().all())
+
+    @classmethod
     @with_session
     async def prepare_login_sessions(cls, session: AsyncSession, *, startup: bool = False) -> None:
         now = time.time()
@@ -298,12 +306,16 @@ class Store:
                 await session.delete(row)
             elif row.expires_at <= now and row.status in ("pending", "verifying"):
                 row.status = "expired"
+                row.submission = ""
                 row.message = "登录链接已过期，请重新发送 wt登录。"
                 session.add(row)
+                session.add(Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message))
             elif startup and row.status == "processing":
                 row.status = "failed"
+                row.submission = ""
                 row.message = "登录处理已中断，请重新发送 wt登录。"
                 session.add(row)
+                session.add(Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message))
         if startup:
             accounts = (
                 (await session.execute(select(Account).where(col(Account.token_state) == "login_unconfirmed")))

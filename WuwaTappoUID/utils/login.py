@@ -81,8 +81,12 @@ class LoginManager:
             for old in opened:
                 old.status = "revoked"
                 old.message = "该链接已被新的登录链接替代，请使用最新链接。"
+                old.submission = ""
+                old.external_synced = True
+                old.external_poll_token = ""
+                self._remote_retries.pop(old.id, None)
             await Store.save(*opened, row)
-        url = base + "/wuwatappouid/login#state=" + state
+        url = base + "/wuwatappouid/i/" + state
         try:
             card = await render_in_thread(render_login, url)
         except Exception:
@@ -101,7 +105,11 @@ class LoginManager:
         if row.expires_at <= time.time() and row.status in ("pending", "verifying"):
             row.status = "expired"
             row.message = "登录链接已过期，请重新发送 wt登录。"
-            await Store.save(row)
+            row.submission = ""
+            await Store.save(
+                row, Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message)
+            )
+            self.wake_notices()
         return row
 
     @staticmethod
@@ -117,14 +125,31 @@ class LoginManager:
             },
         }
 
-    async def status(self, state: str) -> dict:
-        return self.response(await self.get(state))
-
-    async def complete(self, state: str, sdk: SdkLogin | None) -> dict:
+    async def page_state(self, state: str) -> dict:
         row = await self.get(state)
         if row.external_url:
-            raise WuwaError("请在外置登录页面完成登录。")
-        return await self.complete_key(row.id, sdk)
+            raise WuwaError("请使用机器人提供的外置登录链接。")
+        result = self.response(row)
+        if row.submission and row.status in ("pending", "verifying"):
+            result["data"]["state"] = "processing"
+            result["msg"] = "登录资料已提交，请返回机器人查看结果。"
+        return result
+
+    async def submit(self, state: str, sdk: SdkLogin | None) -> dict:
+        row = await self.get(state)
+        async with self.service.user_lock(row.owner_id):
+            row = await self.get(state)
+            if row.external_url:
+                raise WuwaError("请在外置登录页面完成登录。")
+            if row.status not in ("pending", "verifying", "processing", "success"):
+                raise WuwaError(row.message or "登录链接已失效，请重新发送 wt登录。")
+            if row.submission or row.status in ("processing", "success"):
+                return {"success": True}
+            if row.status == "pending" and sdk is None:
+                raise WuwaError("请先登录库洛账号。")
+            row.submission = sdk.model_dump_json() if row.status == "pending" else "null"
+            await Store.save(row)
+        return {"success": True}
 
     async def complete_key(self, key: str, sdk: SdkLogin | None) -> dict:
         row = await self.get_key(key)
@@ -136,9 +161,12 @@ class LoginManager:
                 return self.response(row)
             try:
                 if row.status == "pending":
+                    if row.submission:
+                        sdk = SdkLogin.model_validate_json(row.submission)
                     if sdk is None:
                         raise WuwaError("请先填写手机号和验证码后登录。")
                     row.status = "processing"
+                    row.submission = ""
                     await Store.save(row)
                     roles = await self.service.api.login_roles(sdk)
                     role = next(
@@ -152,6 +180,8 @@ class LoginManager:
                     target = account_id(sdk.cuid, 1)
                 else:
                     target = row.account_id
+                    row.submission = ""
+                    await Store.save(row)
                 async with self.service.account_lock(target):
                     if row.status == "processing":
                         # 角色查询和等锁期间链接可能已到期；发认证请求前重新检查。
@@ -247,6 +277,7 @@ class LoginManager:
                 if row.status != "verifying":
                     row.status = "failed"
                 row.message = str(error)
+                row.submission = ""
                 await Store.save(row)
             except SQLAlchemyError as error:
                 await self.service.disable_database(error)
@@ -254,6 +285,7 @@ class LoginManager:
             except Exception:
                 logger.exception("[WuwaTappoUID] 网页登录处理异常")
                 row.status = "failed"
+                row.submission = ""
                 row.message = "登录处理出现异常，已记录，请重新发送 wt登录。"
                 await Store.save(row)
         return self.response(row)
@@ -262,6 +294,41 @@ class LoginManager:
         job = scheduler.get_job("WuwaTappoUID:notice")
         if job is not None:
             job.modify(next_run_time=datetime.now(timezone.utc))
+
+    async def notify_result(self, row: LoginSession) -> None:
+        if row.status not in ("failed", "verifying"):
+            return  # 成功和到期通知已与状态一起保存。
+        note = "\n请重新打开原登录链接，点击继续登录。" if row.status == "verifying" else "\n请重新发送 wt登录。"
+        await Store.save(
+            Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message + note)
+        )
+        self.wake_notices()
+
+    async def poll_local(self) -> None:
+        if not self.service.database_ready or self.service.closing:
+            return
+        try:
+            rows = await Store.local_logins()
+            await asyncio.gather(*(self.poll_local_one(row) for row in rows))
+        except SQLAlchemyError as error:
+            await self.service.disable_database(error)
+
+    async def poll_local_one(self, snapshot: LoginSession) -> None:
+        if self.service.user_lock(snapshot.owner_id).locked():
+            return
+        try:
+            await self.complete_key(snapshot.id, None)
+            row = await Store.login_session(snapshot.id)
+            if row.status not in ("pending", "verifying") and row.submission:
+                row.submission = ""
+                await Store.save(row)
+            await self.notify_result(row)
+        except SQLAlchemyError:
+            raise
+        except WuwaError as error:
+            logger.warning(f"[WuwaTappoUID] 本地登录处理未完成：{self.service.error_detail(error)}")
+        except Exception:
+            logger.exception("[WuwaTappoUID] 本地登录会话处理异常")
 
     async def poll_external(self) -> None:
         if not self.service.database_ready or self.service.closing:
@@ -297,6 +364,7 @@ class LoginManager:
                     return
                 result = await self.complete_key(row.id, data.login)
                 row = await Store.login_session(row.id)
+                await self.notify_result(row)
             else:
                 result = self.response(row)
             await login_remote.confirm(self.service.api, row, result)

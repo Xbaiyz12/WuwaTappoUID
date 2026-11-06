@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.1.43 — 2026-11-06
+
+- 本地及外置登录改为WW式会话流程：GET /wuwatappouid/i/{auth}校验会话并将绑定对象、SDK配置写入页面，POST /wuwatappouid/login提交登录结果，不再请求status或sdk-config。
+- 页面提交成功后显示“登录成功”弹窗，5秒后跳转WuwaTappoUID项目主页；最终账号绑定、失败、超时及继续验证结果由机器人通知。
+- 本地提交暂存在会话中，由机器人每秒读取；消费后清除临时SDK凭据。新平台token先保存再验证，继续登录不重新交换token。
+- 外置登录通过/wuwatappouid/token创建会话、/wuwatappouid/get读取和确认结果，页面及接口统一前缀；需同时更新ww-login至0.3.2。
+
 ## 0.1.42 — 2026-11-06
 
 - wt登录保存本人的SDK token、openid、用户名及官方授权有效期，用于用户主动发送wt恢复时免验证码重新登录；不在后台自动重登。

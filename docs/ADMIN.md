@@ -48,7 +48,7 @@
 
 在 GsCore 的 WuwaTappoUID 插件配置中设置 `login_public_url`，填写打开登录页的浏览器能访问到的 HTTP/HTTPS 基础地址，例如 `http://192.168.1.10:8765` 或 `https://login.example.com`，不包含 `/wuwatappouid/login`。本地模式留空时按 GsCore HOST/PORT 生成 HTTP 地址；HOST为0.0.0.0或::时使用127.0.0.1作为本机入口。外置模式必须填写ww-login地址。保留原配置键名以兼容已有配置，不检测或要求公网。
 
-本地模式的登录页与回调复用 GsCore。公网使用 HTTPS 反向代理，只开放 `/wuwatappouid/` 和 `/api/wuwatappouid/login/`，其余路径返回404；不要将管理控制台和WebSocket入口一并开放。
+本地模式的登录页与提交接口复用 GsCore，页面及接口统一位于 `/wuwatappouid/`。公网使用 HTTPS 反向代理，转发该前缀即可，其余路径返回404；不要将管理控制台和WebSocket入口一并开放。
 
 ### 本地登录（默认）
 
@@ -63,15 +63,13 @@ server {
     ssl_certificate /path/to/fullchain.pem;
     ssl_certificate_key /path/to/privkey.pem;
     location /wuwatappouid/ { proxy_pass http://127.0.0.1:8765; }
-    location /api/wuwatappouid/login/ {
-        proxy_pass http://127.0.0.1:8765;
-        proxy_read_timeout 300s;
-    }
     location / { return 404; }
 }
 ```
 
-`wt登录` 在原群聊或私聊发送一次性链接和二维码；同一用户的新链接取代旧链接，5分钟内有效，请勿转发。本地页面会显示脱敏的绑定对象，请确认是本人账号；外置页面沿用现有 ww-login 行为。仅支持国服，海外仍使用 `wt添加token TOKEN 海外`。`wt添加token` 只允许私聊使用。
+`wt登录` 在原群聊或私聊发送 `/wuwatappouid/i/{auth}` 一次性链接和二维码；同一用户的新链接取代旧链接，5分钟内有效，请勿转发。本地与外置页面都在返回HTML前校验会话并写入脱敏绑定对象和SDK配置，不再由浏览器请求status或sdk-config。仅支持国服，海外仍使用 `wt添加token TOKEN 海外`。`wt添加token` 只允许私聊使用。
+
+浏览器通过 `/wuwatappouid/login` 提交SDK凭据，机器人随后读取会话并完成账号绑定。本地每秒读取已提交会话，临时SDK数据消费后清除。页面按WW交互显示“登录成功”弹窗，5秒后跳转WuwaTappoUID项目主页；该弹窗表示SDK登录及提交成功，最终绑定结果以机器人通知为准。登录失败、链接超时或处理被重启中断时也通过机器人通知。新token已取得但验证未完成时，机器人提示重新打开原链接点击“继续登录”，不重新交换token。
 
 页面直接提供手机号、验证码输入框和登录按钮，浏览器按官方 KrSDK 的短信/OAuth 接口获取真实SDK凭据，再交给插件交换WuwaTappo token并验证账号。没有鸣潮角色也可以登录：按官方客户端使用角色及区服占位值0，显示“漂泊者”；渠道缺失时使用0。手机号和短信验证码直接发送至库洛接口，不发送给 GsCore 或 ww-login；需要人机验证时才打开验证窗口。页面不接收WuwaTappo token。认证请求不会自动重发；新token已取得但验证中断时，原页面可点击继续登录。
 
@@ -83,15 +81,15 @@ HTTP601表示官方维护。插件暂缓游戏业务请求，每分钟仅通过�
 
 ### 外置登录（ww-login）
 
-1. 部署已加入 WuwaTappoUID 支持的 ww-login，为它配置 HTTPS。
+1. 部署 ww-login 0.3.2及以上版本。WuwaTappoUID 0.1.43与新版外置协议配套升级，更新后重新发送wt登录。
 2. 插件配置中将 `login_use_local` 关闭，`login_public_url` 填写 ww-login 的地址，例如 `https://login.example.com`。
 3. 重启 GsCore。用户仍发送 `wt登录`，使用同样的5分钟链接和二维码。
 
-外置服务需要转发 `/wuwatappouid/` 和 `/api/wuwatappouid/login/`。也使用 XWUID 时，同时保留 `/waves/` 的反代。GsCore 只需能主动访问 ww-login 和游戏后端，无需公网开放自身网页或 WebSocket。
+外置服务只需转发 `/wuwatappouid/`，与本地使用相同的会话页面和提交路径。插件通过POST `/wuwatappouid/token`创建会话，通过POST `/wuwatappouid/get`读取和确认结果，保留私有轮询凭证。也使用 XWUID 时，同时保留 `/waves/` 的反代。GsCore 只需能主动访问 ww-login 和游戏后端，无需公网开放自身网页或 WebSocket。
 
 插件正常每3秒查询外置登录结果，通信失败按3、6、12、24、30秒退避，之后每30秒重试至链接到期。短暂断线不直接判为登录失败，也不逐会话给主人告警。浏览器不持有私有轮询凭证或 WuwaTappo token。
 
-外置服务没有第二套账号库，也不执行 SDK 自动重登。服务重启导致临时会话丢失时，重新发送 `wt登录`；已保存的新token仍由插件验证，不回退旧token。网络中断后页面可点击“查询结果”；待验证状态可点击“继续登录”，不会重复交换token。
+外置服务没有第二套账号库，也不执行 SDK 自动重登。服务重启导致临时会话丢失时，重新发送 `wt登录`；已保存的新token仍由插件验证，不回退旧token。提交结果不明时返回机器人查看结果，或重新打开原链接查看服务器保存的会话；待验证状态可点击“继续登录”，不会重复交换token。
 
 ## 登录态失效与任务恢复
 

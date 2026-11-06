@@ -25,7 +25,7 @@ class RemoteResponse(BaseModel):
 async def request(api: WuwaAPI, base: str, path: str, payload: dict) -> RemoteData:
     try:
         async with api.client().post(
-            base + "/api/wuwatappouid/login/" + path,
+            base + "/wuwatappouid/" + path,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=12),
         ) as response:
@@ -45,7 +45,7 @@ async def request(api: WuwaAPI, base: str, path: str, payload: dict) -> RemoteDa
 
 
 async def create(api: WuwaAPI, base: str, platform: str, user_id: str) -> RemoteData:
-    data = await request(api, base, "session", {"bot_id": platform, "user_id": user_id})
+    data = await request(api, base, "token", {"bot_id": platform, "user_id": user_id})
     if not data.state or not data.poll_token or not data.expires_at:
         raise DataError("外置登录服务没有返回有效的一次性会话。")
     return data
@@ -55,7 +55,7 @@ async def poll(api: WuwaAPI, row: LoginSession) -> RemoteData:
     return await request(
         api,
         row.external_url,
-        "result",
+        "get",
         {
             "state": row.external_state,
             "poll_token": row.external_poll_token,
@@ -67,7 +67,7 @@ async def confirm(api: WuwaAPI, row: LoginSession, result: dict) -> None:
     await request(
         api,
         row.external_url,
-        "result",
+        "get",
         {
             "state": row.external_state,
             "poll_token": row.external_poll_token,
