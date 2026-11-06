@@ -1,5 +1,9 @@
 # 更新记录
 
+## 0.1.44 — 2026-11-06
+
+- 账号信息卡昵称区域只显示名字，移除昵称下方的UID；保留右上角CUID和区服。
+
 ## 0.1.43 — 2026-11-06
 
 - 本地及外置登录改为WW式会话流程：GET /wuwatappouid/i/{auth}校验会话并将绑定对象、SDK配置写入页面，POST /wuwatappouid/login提交登录结果，不再请求status或sdk-config。

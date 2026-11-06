@@ -182,8 +182,6 @@ def render_account(
     else:
         text(draw, 98, 256, "头像暂不可用" if info.character is not None else "未设置", 13, SOFT, align="center")
     text(draw, 154, 249, info.display_name, 25, line=36, rounded=False, weight=700, limit=270)
-    if str(info.player_id) not in ("", "0"):
-        text(draw, 154, 289, f"UID {info.player_id}", 13, SOFT, limit=550)
     text(draw, 840, 245, f"CUID {cuid}", 18, align="right", limit=278)
     text(draw, 840, 278, "国服" if domestic else "海外", 14, SOFT, align="right")
     stats(canvas, draw, 332, info)
