@@ -26,8 +26,11 @@ settings = StringConfig(
             data=24,
         ),
         "login_public_url": GsStrConfig(
-            title="登录页面公网地址",
-            desc="HTTPS 登录入口，如 https://login.example.com；本地模式反代 GsCore，外置模式填写 ww-login 地址。",
+            title="登录页面地址",
+            desc=(
+                "浏览器可访问的 HTTP/HTTPS 地址；本地模式留空使用 GsCore HOST/PORT，"
+                "也可填写反代或隧道地址；外置模式必填 ww-login 地址。"
+            ),
             data="",
         ),
         "login_use_local": GsBoolConfig(

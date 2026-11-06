@@ -61,7 +61,7 @@
     const response = await fetch(new URL(path, apiBase), {
       method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload),cache:"no-store"
     });
-    if (!response.ok) throw new Error("登录服务暂不可用，请稍后再试。");
+    if (!response.ok) throw new Error(`登录服务暂不可用（接口 ${path}，HTTP ${response.status}），请联系机器人管理员。`);
     return await response.json();
   }
   function captcha() {
@@ -159,7 +159,7 @@
       if (!account || !account.code) throw new Error("库洛登录响应不完整，请稍后重试。");
       const access = await sdk("auth/getToken.lg",{code:account.code,client_id:config.clientId,client_secret:config.clientSecret,grant_type:"authorization_code"},false);
       if (!access || !access.access_token || !account.cuid || !account.id || !account.username) throw new Error("库洛登录凭据不完整，请稍后重试。");
-      await submit({token:access.access_token,cuid:String(account.cuid),sdk_openid:String(account.id),username:String(account.username)});
+      await submit({token:access.access_token,cuid:String(account.cuid),sdk_openid:String(account.id),username:String(account.username),expires_in:Number(access.expires_in)||0});
     } catch (error) {busy = false;enableInputs(true);button.disabled = false;button.textContent = "登录";show(error.message,true);}
   });
   async function initialize() {

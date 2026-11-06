@@ -114,6 +114,7 @@ class SdkLogin(BaseModel):
     cuid: str = Field(pattern=r"^[0-9]{6,16}$")
     sdk_openid: str = Field(min_length=1, max_length=128)
     username: str = Field(min_length=1, max_length=128)
+    expires_in: int = Field(default=0, ge=0)
 
 
 def token_expiry(value: int | float | str | None) -> float:

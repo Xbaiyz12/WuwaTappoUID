@@ -24,6 +24,7 @@ from .formatting import account_text, date_text, mask_cuid, task_text
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
+    CN_SERVER_ID,
     CODE_OK,
     NET_SERVER_IDS,
     RENEW_WINDOW,
@@ -41,10 +42,12 @@ from .schema import (
     Item,
     MaintenanceError,
     NetworkError,
+    SdkLogin,
     Side,
     SynthesisResult,
     UserInfo,
     WuwaError,
+    token_expiry,
 )
 from .settings import bot_name, chest_task_hours, max_click_increment, retry_limit
 from .synthesis import highest_tiers, next_recipe
@@ -159,8 +162,28 @@ class Service:
         if account is None:
             raise WuwaError("绑定的账号数据缺失，请重新绑定。")
         if account.token_state == "expired" and not allow_expired:
-            raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
+            raise AuthenticationError(self.expired_message(account, binding.id))
+        if account.token_state == "recovering" and not allow_expired:
+            raise AuthenticationError("新登录凭据已保存，尚待验证；请发送 wt恢复 继续验证。")
         return binding, account
+
+    @staticmethod
+    def expired_message(account: Account, owner_id: str) -> str:
+        if account.can_recover(owner_id):
+            return (
+                "登录态已失效，可发送 wt恢复 使用已保存的SDK凭据重新登录。"
+                f"\nSDK恢复凭据有效至：{date_text(account.sdk_expires_at)}"
+                "\n恢复登录会使官方客户端当前的登录态失效。"
+            )
+        return TOKEN_EXPIRED_MESSAGE
+
+    async def authentication_message(self, event: Event, error: AuthenticationError) -> str:
+        binding = await Store.binding(identity(event.bot_id, event.user_id))
+        if binding is not None:
+            account = await Store.account(binding.account_id)
+            if account is not None and account.token_state == "expired":
+                return self.expired_message(account, binding.id)
+        return str(error)
 
     async def expire_account(self, account: Account) -> None:
         """已确认 token 失效；只通知一次，更新有效 token 后恢复鉴权暂停的任务。"""
@@ -177,8 +200,12 @@ class Service:
                     Notice(
                         subscription_id=task.subscription_id,
                         account_id=account.id,
-                        text=f"{date_text(time.time())}：token已过期，自动开箱已暂停。"
-                        "请发送 wt登录 或 wt添加token 更新；因token过期暂停的有效任务将自动恢复。",
+                        text=f"{date_text(time.time())}：{self.expired_message(account, task.owner_id)}"
+                        + (
+                            "\n自动开箱已暂停，原到期时间保留。"
+                            if task.pause_reason == "auth"
+                            else "\n任务维持原暂停状态。"
+                        ),
                     )
                 )
             await Store.save(*rows)
@@ -213,10 +240,17 @@ class Service:
             account.token_expires_at = saved.token_expires_at
             account.token_renew_after = saved.token_renew_after
             account.token_state = saved.token_state
+            account.sdk_token = saved.sdk_token
+            account.sdk_openid = saved.sdk_openid
+            account.sdk_username = saved.sdk_username
+            account.sdk_expires_at = saved.sdk_expires_at
+            account.sdk_owner_id = saved.sdk_owner_id
             account.info = saved.info
             account.verified_at = saved.verified_at
         if account.token_state == "expired":
             raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
+        if account.token_state == "recovering":
+            raise AuthenticationError("新登录凭据已保存，尚待验证；请发送 wt恢复 继续验证。")
         try:
             info = await self.api.me(account.token, fresh=fresh)
         except ApiError as error:
@@ -328,6 +362,8 @@ class Service:
                 account = await Store.account(target)
                 if account is None:
                     account = Account(id=target, cuid=cuid, domestic=domestic)
+                if account.sdk_owner_id == owner:
+                    account.clear_sdk()
                 # refresh 会优先使用数据库里的旧 token；新会话验证后直接保存。
                 account.token = token
                 account.token_state = "ready"
@@ -859,14 +895,14 @@ class Service:
         return answer
 
     async def set_paused(self, event: Event, paused: bool) -> str:
+        if not paused:
+            return await self.recover(event)
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             binding, account = await self.bound(event, allow_expired=paused)
             async with self.account_lock(account.id):
                 account = await Store.account(binding.account_id)
                 if account is None:
                     raise WuwaError("绑定的账号数据缺失，请重新绑定。")
-                if not paused and account.token_state == "expired":
-                    raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
                 task = await Store.task(account.id)
                 if task is None or task.status not in ("active", "paused"):
                     action = "暂停" if paused else "恢复"
@@ -876,32 +912,13 @@ class Service:
                 if task.remaining() <= 0:
                     await self.finish(task, "expired", "本轮已到期")
                     answer = "本轮已到期，请用 wt宝箱 开启新任务。"
-                elif paused and task.timer_paused:
+                elif task.timer_paused:
                     answer = "任务和计时已经暂停。\n" + task_text(task)
-                elif not paused and task.status == "active":
-                    answer = "任务正在运行。\n" + task_text(task)
                 else:
-                    if paused:
-                        task.status = "paused"
-                        task.pause_reason = "manual"
-                        task.paused_at = time.time()
-                        action = "宝箱任务和计时已暂停，剩余有效期保留。"
-                    else:
-                        info = await self.refresh(account, fresh=True)
-                        if not await self.reconcile(task, info):
-                            raise WuwaError("开箱结果仍未确认，任务保持暂停，请稍后恢复。")
-                        if task.remaining() <= 0:
-                            await self.finish(task, "expired", "本轮已到期")
-                            return "本轮已到期，请用 wt宝箱 开启新任务。"
-                        if task.paused_at is not None:
-                            task.expires_at += time.time() - task.paused_at
-                        task.paused_at = None
-                        task.status = "active"
-                        task.pause_reason = ""
-                        task.failures = 0
-                        await self.failures.reset_account(account.id)
-                        await Store.reset_notice_attempts(account.id)
-                        action = "宝箱任务已恢复，继续剩余有效期。"
+                    task.status = "paused"
+                    task.pause_reason = "manual"
+                    task.paused_at = time.time()
+                    action = "宝箱任务和计时已暂停，剩余有效期保留。"
                     task.next_check = time.time()
                     await Store.save(
                         task,
@@ -911,12 +928,143 @@ class Service:
                             text=action + "\n" + task_text(task),
                         ),
                     )
-                    if paused:
-                        self.unschedule(account.id)
-                        await self.queue_results(account.id, force=True, reason="任务暂停")
-                    else:
-                        self.schedule(task)
+                    self.unschedule(account.id)
+                    await self.queue_results(account.id, force=True, reason="任务暂停")
                     answer = action + "\n" + task_text(task)
+        await self.flush_notices()
+        return answer
+
+    async def recover(self, event: Event) -> str:
+        """用户主动恢复；每次至多交换一次，已取得的新token只继续验证。"""
+        async with self.user_lock(identity(event.bot_id, event.user_id)):
+            binding, account = await self.bound(event, allow_expired=True)
+            async with self.account_lock(account.id):
+                account = await Store.account(binding.account_id)
+                if account is None:
+                    raise WuwaError("绑定的账号数据缺失，请重新绑定。")
+                task = await Store.task(account.id)
+                if task is not None and task.status in ("active", "paused") and task.owner_id != binding.id:
+                    raise WuwaError("任务属于另一用户，请由任务所属用户恢复。")
+                pending = account.token_state == "recovering"
+                exchanged = pending
+                info = None
+                if account.token_state != "expired":
+                    try:
+                        info = await self.api.me(account.token, fresh=True)
+                    except ApiError as error:
+                        if not error.is_auth:
+                            raise
+                        await self.expire_account(account)
+                        if pending:
+                            raise AuthenticationError(
+                                "新登录态已被拒绝，本次未重复登录；请稍后重新发送 wt恢复。"
+                            ) from None
+                    except (NetworkError, DataError):
+                        if not pending:
+                            raise
+                        return "新登录凭据已保存，验证尚未完成；请稍后发送 wt恢复 继续验证，不会重复交换token。"
+                if info is None:
+                    if not account.can_recover(binding.id):
+                        if account.sdk_owner_id == binding.id:
+                            account.clear_sdk()
+                            await Store.save(account)
+                        raise AuthenticationError(self.expired_message(account, binding.id))
+                    sdk = SdkLogin(
+                        token=account.sdk_token,
+                        cuid=account.cuid,
+                        sdk_openid=account.sdk_openid,
+                        username=account.sdk_username,
+                    )
+                    try:
+                        roles = await self.api.login_roles(sdk)
+                        role = next(
+                            (
+                                item
+                                for item in roles.items
+                                if str(item.playerId).isdigit()
+                                and int(item.playerId) > 0
+                                and item.serverId == CN_SERVER_ID
+                            ),
+                            None,
+                        )
+                        token = await self.api.exchange_sdk_token(sdk, role, roles.channelId)
+                    except ApiError as error:
+                        if error.code == 10024 or error.is_auth:
+                            account.clear_sdk()
+                            await Store.save(account)
+                            raise AuthenticationError(
+                                "保存的SDK凭据已被拒绝，请发送 wt登录 或 wt添加token 更新登录态。"
+                            ) from None
+                        raise
+                    account.token = token.token
+                    account.token_state = "recovering"
+                    account.token_expires_at = 0
+                    account.token_renew_after = 0
+                    await Store.save(account)
+                    try:
+                        account.token_expires_at = token_expiry(token.expire_time)
+                        await Store.save(account)
+                        info = await self.api.me(account.token, fresh=True)
+                    except (NetworkError, DataError):
+                        return "新登录凭据已取得并保存，验证尚未完成；请稍后发送 wt恢复 继续验证，不会重复交换token。"
+                    except ApiError as error:
+                        if error.is_auth:
+                            await self.expire_account(account)
+                            raise AuthenticationError(
+                                "新登录态已被拒绝，本次未重复登录；请稍后重新发送 wt恢复。"
+                            ) from None
+                        raise
+                    exchanged = True
+                if (
+                    str(info.cuid) != account.cuid
+                    or info.is_domestic is not None
+                    and info.is_domestic != account.domestic
+                    or exchanged
+                    and str(info.server_id) not in ("0", CN_SERVER_ID)
+                ):
+                    account.token_state = "expired"
+                    await Store.save(account)
+                    raise DataError("恢复结果的账号或区服不一致，本次未恢复任务。")
+                account.info = info.model_dump_json()
+                account.verified_at = time.time()
+                account.token_state = "ready"
+                await Store.save(account)
+                if exchanged:
+                    await self.failures.success("renew:" + account.id)
+                prefix = "登录已恢复，同账号其他客户端的旧登录态已失效。" if exchanged else "登录态正常。"
+                task = await Store.task(account.id)
+                if task is None or task.status not in ("active", "paused"):
+                    answer = prefix + "当前没有待恢复的宝箱任务。"
+                elif task.remaining() <= 0:
+                    await self.finish(task, "expired", "本轮已到期")
+                    answer = prefix + "原任务已到期，可发送 wt宝箱 开启新任务。"
+                elif task.status == "active":
+                    answer = prefix + "宝箱任务正在运行。"
+                elif not await self.reconcile(task, info):
+                    answer = prefix + "开箱结果仍待确认，任务保持暂停，可稍后再次 wt恢复。"
+                elif task.remaining() <= 0:
+                    await self.finish(task, "expired", "本轮已到期")
+                    answer = prefix + "原任务已到期，可发送 wt宝箱 开启新任务。"
+                else:
+                    if task.paused_at is not None:
+                        task.expires_at += time.time() - task.paused_at
+                    task.paused_at = None
+                    task.status = "active"
+                    task.pause_reason = ""
+                    task.failures = 0
+                    await self.failures.reset_account(account.id)
+                    await Store.reset_notice_attempts(account.id)
+                    task.next_check = self.next_wakeup(task, info)
+                    await Store.save(
+                        task,
+                        Notice(
+                            subscription_id=task.subscription_id,
+                            account_id=account.id,
+                            text="登录态已确认，宝箱任务已恢复，继续原轮次。",
+                        ),
+                    )
+                    self.schedule(task)
+                    answer = prefix + "宝箱任务已恢复，继续原轮次。\n" + task_text(task)
         await self.flush_notices()
         return answer
 

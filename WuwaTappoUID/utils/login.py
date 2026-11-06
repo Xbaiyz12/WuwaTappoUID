@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 from gsuid_core.aps import scheduler
+from gsuid_core.config import core_config
 from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.subscribe import gs_subscribe
@@ -37,10 +38,18 @@ class LoginManager:
 
     async def create(self, event: Event) -> list[str | bytes]:
         self.service.require_database()
+        use_local = settings.get_config("login_use_local").data
         base = settings.get_config("login_public_url").data.strip().rstrip("/")
+        if not base and use_local:
+            host = core_config.get_config("HOST")
+            if host in ("0.0.0.0", "::"):
+                host = "127.0.0.1"
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            base = f"http://{host}:{core_config.get_config('PORT')}"
         address = urlsplit(base)
-        if address.scheme != "https" or not address.netloc or address.query or address.fragment:
-            raise WuwaError("主人尚未配置有效的 HTTPS 登录页面公网地址，请暂用 wt添加token。")
+        if address.scheme not in ("http", "https") or not address.netloc or address.query or address.fragment:
+            raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
         owner = identity(event.bot_id, event.user_id)
         async with self.service.user_lock(owner):
             opened = await Store.open_logins(owner)
@@ -48,7 +57,7 @@ class LoginManager:
                 raise WuwaError("登录正在处理，请等待结果。")
             state = secrets.token_urlsafe(32)
             remote = None
-            if not settings.get_config("login_use_local").data:
+            if not use_local:
                 remote = await login_remote.create(self.service.api, base, event.bot_id, event.user_id)
                 state = remote.state
             key = session_key(state)
@@ -153,6 +162,14 @@ class LoginManager:
                             account = Account(id=target, cuid=sdk.cuid, domestic=1)
                         token = await self.service.api.exchange_sdk_token(sdk, role, roles.channelId)
                         account.token = token.token
+                        if sdk.expires_in > 0:
+                            account.sdk_token = sdk.token
+                            account.sdk_openid = sdk.sdk_openid
+                            account.sdk_username = sdk.username
+                            account.sdk_expires_at = time.time() + sdk.expires_in
+                            account.sdk_owner_id = row.owner_id
+                        else:
+                            account.clear_sdk()
                         account.token_state = "pending"
                         account.token_expires_at = 0
                         account.token_renew_after = 0
@@ -201,6 +218,10 @@ class LoginManager:
                         note = f"登录成功，但任务尚未恢复：{self.service.error_detail(error)}；可稍后用 wt恢复。"
                     row.status = "success"
                     row.message = "登录成功，已绑定为当前账号。"
+                    if not account.can_recover(row.owner_id):
+                        note += "\n本次登录未收到SDK有效期，未启用免验证码恢复；使用外置登录时请更新ww-login。"
+                    else:
+                        note += "\n已保存本人的SDK恢复凭据，可在有效期内发送 wt恢复 重新登录。"
                     row.result = json.dumps(
                         {
                             "cuid": mask_cuid(account.cuid),

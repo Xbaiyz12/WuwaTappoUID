@@ -62,6 +62,12 @@ async def import_sessions() -> None:
         old_account = await Store.account(account.id)
         if old_account is not None:
             account.subscribed = old_account.subscribed
+            if old_account.sdk_owner_id != owner:
+                account.sdk_token = old_account.sdk_token
+                account.sdk_openid = old_account.sdk_openid
+                account.sdk_username = old_account.sdk_username
+                account.sdk_expires_at = old_account.sdk_expires_at
+                account.sdk_owner_id = old_account.sdk_owner_id
         await Store.save(
             account,
             Binding(id=owner, platform=entry.platform, user_id=entry.user_id, account_id=account.id),

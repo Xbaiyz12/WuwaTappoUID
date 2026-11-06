@@ -32,7 +32,26 @@ class Account(SQLModel, table=True):
     token_expires_at: float = 0
     token_renew_after: float = 0
     token_state: str = Field(default="ready", max_length=32)
+    sdk_token: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
+    sdk_openid: str = Field(default="", max_length=128)
+    sdk_username: str = Field(default="", max_length=128)
+    sdk_expires_at: float = 0
+    sdk_owner_id: str = Field(default="", max_length=64)
     subscribed: bool = False
+
+    def clear_sdk(self) -> None:
+        self.sdk_token = self.sdk_openid = self.sdk_username = self.sdk_owner_id = ""
+        self.sdk_expires_at = 0
+
+    def can_recover(self, owner_id: str) -> bool:
+        return bool(
+            self.domestic == 1
+            and self.sdk_owner_id == owner_id
+            and self.sdk_token
+            and self.sdk_openid
+            and self.sdk_username
+            and self.sdk_expires_at > time.time()
+        )
 
 
 class Binding(SQLModel, table=True):
@@ -162,6 +181,11 @@ ADDED_COLUMNS = {
         "external_synced": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
     "wt_account": {
+        "sdk_token": "TEXT NOT NULL DEFAULT ''",
+        "sdk_openid": "VARCHAR(128) NOT NULL DEFAULT ''",
+        "sdk_username": "VARCHAR(128) NOT NULL DEFAULT ''",
+        "sdk_expires_at": "FLOAT NOT NULL DEFAULT 0",
+        "sdk_owner_id": "VARCHAR(64) NOT NULL DEFAULT ''",
         "subscribed": "BOOLEAN NOT NULL DEFAULT FALSE",
         "token_expires_at": "FLOAT NOT NULL DEFAULT 0",
         "token_renew_after": "FLOAT NOT NULL DEFAULT 0",
@@ -198,13 +222,19 @@ def _ensure_schema(connection: Connection) -> list[str]:
     tables = [SQLModel.metadata.tables[name] for name in PLUGIN_TABLE_NAMES]
     # 启动前钩子可能被其他插件的异常跳过，补建仅本插件的表。
     SQLModel.metadata.create_all(connection, tables=tables)
-    added = []
+    changes = []
     for table, columns in ADDED_COLUMNS.items():
         existing = {column["name"] for column in inspect(connection).get_columns(table)}
         for name, column_type in columns.items():
             if name not in existing:
                 connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"))
-                added.append(f"{table}.{name}")
+                changes.append(f"新增 {table}.{name}")
+    # 0.1.40 首装创建的旧列没有服务端默认值；删除废弃快照列，避免新账号插入触发非空约束。
+    account_columns = {column["name"] for column in inspect(connection).get_columns("wt_account")}
+    for name in ("role_info", "roles_updated_at"):
+        if name in account_columns:
+            connection.execute(text(f"ALTER TABLE wt_account DROP COLUMN {name}"))
+            changes.append(f"删除 wt_account.{name}")
     missing = []
     inspector = inspect(connection)
     for table in tables:
@@ -215,14 +245,14 @@ def _ensure_schema(connection: Connection) -> list[str]:
     # create_all 跳过已有表时也跳过新增索引，升级时单独创建。
     for index in SQLModel.metadata.tables["wt_chest_record"].indexes:
         index.create(connection, checkfirst=True)
-    return added
+    return changes
 
 
 async def ensure_database_schema() -> None:
     async with base_models.engine.begin() as connection:
-        added = await connection.run_sync(_ensure_schema)
-    if added:
-        logger.info(f"[WuwaTappoUID] 数据库迁移完成，新增字段：{'、'.join(added)}")
+        changes = await connection.run_sync(_ensure_schema)
+    if changes:
+        logger.info(f"[WuwaTappoUID] 数据库迁移完成：{'、'.join(changes)}")
     logger.info("[WuwaTappoUID] 数据库表结构校验通过。")
 
 
@@ -311,6 +341,9 @@ class Store:
     @classmethod
     @with_session
     async def delete_link(cls, session: AsyncSession, owner_id: str, account_id: str, replacement: str | None) -> None:
+        account = await session.get(Account, account_id)
+        if account is not None and account.sdk_owner_id == owner_id:
+            account.clear_sdk()
         link = await session.get(AccountLink, (owner_id, account_id))
         if link is not None:
             await session.delete(link)
@@ -331,6 +364,7 @@ class Store:
             account = await session.get(Account, account_id)
             if account is not None:
                 account.token = ""
+                account.clear_sdk()
                 account.token_state = "expired"
                 account.token_expires_at = account.token_renew_after = 0
 

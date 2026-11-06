@@ -130,7 +130,7 @@ async def wt_command(bot: Bot, event: Event) -> None:
         elif command == "暂停":
             replies = [await service.set_paused(event, True)]
         elif command == "恢复":
-            replies = [await service.set_paused(event, False)]
+            replies = [await service.recover(event)]
         elif command == "停止":
             replies = [await service.stop(event)]
         elif command == "状态":
@@ -147,7 +147,7 @@ async def wt_command(bot: Bot, event: Event) -> None:
         else:
             replies = [help_text(get_plugin_available_prefix("WuwaTappoUID"))]
     except AuthenticationError as error:
-        replies = [str(error)]
+        replies = [str(error) if command == "恢复" else await service.authentication_message(event, error)]
     except (ApiError, DataError, NetworkError) as error:
         replies = [str(error)]
     except WuwaError as error:
