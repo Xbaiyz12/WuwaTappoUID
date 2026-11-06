@@ -20,7 +20,7 @@ from .render_cache import LocalImage, render_in_thread
 from .render_common import Header, Progress
 from .reply_card import TaskSnapshot, render_account, render_clicks, render_task
 from .resources import Resources
-from .schema import ApiError, Item, NetworkError, OpenResult, RoleInfo, SynthesisResult, UserInfo, WuwaError
+from .schema import ApiError, Item, NetworkError, OpenResult, RoleInfo, RoleQuery, SynthesisResult, UserInfo, WuwaError
 
 KINDS = {"character": "角色", "accessory": "配件", "emote": "表情"}
 RESULT_PAGE_SIZE = 40
@@ -54,7 +54,6 @@ class Cards:
         self._catalog_map: dict[str, CatalogEntry] = {}
         self._catalog_types: dict[str, list[CatalogEntry]] = {}
         self._catalog_rarities: dict[tuple[str, str], list[CatalogEntry]] = {}
-        self._uids: dict[str, tuple[float, str]] = {}
         self._avatars: dict[str, tuple[float, bytes]] = {}
 
     def _refresh_catalog(self) -> None:
@@ -176,18 +175,9 @@ class Cards:
                     logger.warning(f"[WuwaTappoUID] 聊天头像暂不可用：{type(error).__name__}")
         info = UserInfo.model_validate_json(account.info) if account.info else None
         uid = str(info.player_id) if info and info.player_id else ""
-        if uid in ("", "0") and account.token_state != "expired":
-            cached_uid = self._uids.get(account.id)
-            if cached_uid is not None and cached_uid[0] > time.time():
-                uid = cached_uid[1]
-            else:
-                try:
-                    async with asyncio.timeout(12):
-                        roles = await self.api.roles(account.cuid, account.domestic)
-                        uid = str(roles[0].playerId) if roles else ""
-                        self._uids[account.id] = (time.time() + 3600, uid)
-                except (WuwaError, TimeoutError) as error:
-                    logger.warning(f"[WuwaTappoUID] 鸣潮 UID 暂不可用：{type(error).__name__}")
+        if uid in ("", "0") and account.role_info:
+            roles = RoleQuery.model_validate_json(account.role_info).items
+            uid = str(roles[0].playerId) if roles else ""
         return Header(nickname=nickname, uid=uid if uid != "0" else "", available=available, avatar=face)
 
     def progress(self, items: list[Item]) -> list[Progress]:

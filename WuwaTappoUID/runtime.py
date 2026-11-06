@@ -16,7 +16,7 @@ from .utils.database import Account, AccountLink, Binding, Store, ensure_databas
 from .utils.failures import ALERT_JOB
 from .utils.login import LoginManager
 from .utils.resources import Resources
-from .utils.schema import DatabaseSchemaError, DataError, SessionImport, WuwaError, token_expiry
+from .utils.schema import DatabaseSchemaError, DataError, MaintenanceError, SessionImport, WuwaError, token_expiry
 from .utils.service import Service, account_id, identity
 from .utils.settings import retry_limit
 
@@ -112,7 +112,7 @@ async def wt_initialize() -> None:
 
 async def wt_update_resources() -> None:
     # 连续异常计数仅在本次运行中使用，待发送告警单独落盘。
-    for _ in range(retry_limit()):
+    while not service.closing:
         if service.failures.blocked("resources"):
             return
         delay = max(0, service.failures.retry_after("resources") - time.time())
@@ -122,6 +122,9 @@ async def wt_update_resources() -> None:
             return
         try:
             result = await resources.update()
+        except MaintenanceError:
+            await asyncio.sleep(60)
+            continue
         except Exception as error:
             if service.failures.attempts("resources") == 0:
                 logger.exception("[WuwaTappoUID] 资源更新出现意外错误")

@@ -24,6 +24,7 @@ from .formatting import account_text, date_text, mask_cuid, role_text, task_text
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
+    CODE_OK,
     NET_SERVER_IDS,
     RENEW_WINDOW,
     SETTLE_SECONDS,
@@ -38,8 +39,10 @@ from .schema import (
     DataError,
     Expired,
     Item,
+    MaintenanceError,
     NetworkError,
     RoleInfo,
+    RoleQuery,
     Side,
     SynthesisResult,
     UserInfo,
@@ -107,7 +110,7 @@ class Service:
 
     @staticmethod
     def error_detail(error: Exception) -> str:
-        if isinstance(error, (ApiError, NetworkError)):
+        if isinstance(error, (ApiError, NetworkError, MaintenanceError)):
             return error.details
         return str(error) if isinstance(error, WuwaError) else type(error).__name__
 
@@ -215,6 +218,8 @@ class Service:
             account.token_renew_after = saved.token_renew_after
             account.token_state = saved.token_state
             account.info = saved.info
+            account.role_info = saved.role_info
+            account.roles_updated_at = saved.roles_updated_at
             account.verified_at = saved.verified_at
         if account.token_state == "expired":
             raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
@@ -247,6 +252,8 @@ class Service:
             return
         try:
             await self.api.renew_token(account.token)
+        except MaintenanceError:
+            raise
         except WuwaError as error:
             account.token_renew_after = now + TOKEN_RENEW_RETRY
             await Store.save(account)
@@ -498,22 +505,17 @@ class Service:
                 await Store.save(*batch, notice)
 
     async def role_details(self, account: Account) -> tuple[list[RoleInfo], str]:
-        """角色只用于展示：查询失败不影响绑定和其他命令。"""
+        """读取上次 SDK 登录的角色资料，不再发送缺少凭据的查询。"""
         region = "国服" if account.domestic else "海外"
-        try:
-            roles = await self.api.roles(account.cuid, account.domestic)
-        except WuwaError:
-            return [], "角色暂时查询不到，稍后发送 wt信息 重试"
-        if roles:
-            return roles[:3], ""
-        # 本区服没有角色时看一眼另一个区服，提示是不是绑定时选错了。
-        other = 0 if account.domestic else 1
-        try:
-            elsewhere = await self.api.roles(account.cuid, other)
-        except WuwaError:
-            elsewhere = []
-        hint = f"；{'海外' if other == 0 else '国服'}有角色，可能绑定时选错了区服" if elsewhere else ""
-        return [], f"{region}下没有查到游戏角色{hint}"
+        if account.role_info:
+            roles = RoleQuery.model_validate_json(account.role_info).items
+            note = f"角色资料来自上次登录：{date_text(account.roles_updated_at)}"
+            return roles[:3], note if roles else f"{region}下未查到游戏角色。{note}"
+        info = UserInfo.model_validate_json(account.info) if account.info else None
+        note = "角色详细资料将在下次 wt登录 时更新。"
+        if info is not None and str(info.player_id) not in ("", "0"):
+            return [RoleInfo(playerId=info.player_id, serverId=str(info.server_id))], note
+        return [], note
 
     async def info(self, event: Event) -> list[str | bytes]:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
@@ -595,6 +597,11 @@ class Service:
                     await Store.save(record)
                     try:
                         result = await self.api.synthesize(account.token, recipe.asset_ids, recipe.same_level)
+                    except MaintenanceError as error:
+                        record.state, record.error = "rejected", str(error)
+                        await Store.save(record)
+                        problem = str(error)
+                        break
                     except ApiError as error:
                         record.state, record.error = "rejected", str(error)
                         await Store.save(record)
@@ -670,7 +677,7 @@ class Service:
             ack = await self.api.set_clicks(
                 account.token, before.total_click_count + number, task.expires_at if task is not None else None
             )
-            if ack != 0:
+            if ack not in CODE_OK:
                 problem = str(ApiError(ack))
         except ApiError as error:
             problem = str(error)
@@ -825,6 +832,8 @@ class Service:
                     info = await self.api.me(account.token, fresh=True)
                     if str(info.cuid) != account.cuid:
                         raise DataError("结束任务核对的CUID与账号不一致。")
+                except MaintenanceError:
+                    pass
                 except WuwaError as error:
                     await self.failures.fail(
                         "reconcile:" + account.id,
@@ -1019,6 +1028,11 @@ class Service:
                 raise Expired
             try:
                 result = await self.api.open(account.token, side, info.total_click_count)
+            except MaintenanceError as error:
+                record.state = "rejected"
+                record.result = str(error)
+                await Store.save(record)
+                raise
             except ApiError as error:
                 record.state = "rejected"
                 record.result = str(error)
@@ -1065,6 +1079,8 @@ class Service:
             await self.flush_notices()
         except SQLAlchemyError as error:
             await self.disable_database(error)
+        except MaintenanceError:
+            return
         except Exception as error:
             if self.failures.attempts("check:" + key) > attempts_before:
                 return
@@ -1138,6 +1154,8 @@ class Service:
                 task.failures = 0
             except Expired:
                 await self.finish(task, "expired", "本轮自动开箱已结束")
+            except MaintenanceError:
+                retry = True
             except NetworkError as error:
                 # 每轮网络请求自身有有限重试；持续失败也有后台轮次上限。
                 await self.task_failure(task, error)
@@ -1243,6 +1261,8 @@ class Service:
             await self.failures.success("maintain")
         except SQLAlchemyError as error:
             await self.disable_database(error)
+        except MaintenanceError:
+            return
         except Exception as error:
             if self.failures.attempts("maintain") == 0:
                 logger.exception("[WuwaTappoUID] 后台巡检出现意外错误")
@@ -1285,6 +1305,8 @@ class Service:
                         await self.failures.success("reconcile:" + key)
                     except SQLAlchemyError:
                         raise
+                    except MaintenanceError:
+                        continue
                     except Exception as error:
                         await self.failures.fail(
                             "reconcile:" + key,
@@ -1304,6 +1326,8 @@ class Service:
                         await self.failures.success("results:" + key)
                     except SQLAlchemyError:
                         raise
+                    except MaintenanceError:
+                        continue
                     except Exception as error:
                         await self.failures.fail("results:" + key, "开箱结果汇总", self.error_detail(error), key)
         await self.flush_notices()
@@ -1373,6 +1397,8 @@ class Service:
             await self.failures.success("notice_loop")
         except SQLAlchemyError as error:
             await self.disable_database(error)
+        except MaintenanceError:
+            return
         except Exception as error:
             if self.failures.attempts("notice_loop") == 0:
                 logger.exception("[WuwaTappoUID] 通知巡检出现意外错误")
@@ -1418,6 +1444,8 @@ class Service:
                         await self.failures.success(render_key)
                     except SQLAlchemyError:
                         raise
+                    except MaintenanceError:
+                        continue
                     except Exception as error:
                         if self.failures.attempts(render_key) == 0:
                             logger.exception("[WuwaTappoUID] 通知图片绘制失败")

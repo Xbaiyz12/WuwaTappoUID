@@ -27,6 +27,7 @@ from .schema import (
     Expired,
     Item,
     LoginData,
+    MaintenanceError,
     NetworkError,
     OpenResult,
     RoleInfo,
@@ -59,7 +60,6 @@ class ReadCache:
     active: bool = True
     users: dict[tuple[str, int], UserInfo] = field(default_factory=dict)
     bags: dict[tuple[str, int], list[Item]] = field(default_factory=dict)
-    roles: dict[tuple[str, int], list[RoleInfo]] = field(default_factory=dict)
 
 
 _read_cache: ContextVar[ReadCache | None] = ContextVar("wt_read_cache", default=None)
@@ -130,6 +130,34 @@ class WuwaAPI:
         self.session: aiohttp.ClientSession | None = None
         self._versions: dict[str, int] = {}
         self._requests: dict[str, AccountRequests] = {}
+        self._socket_rooms: dict[str, str] = {}
+        self.maintenance = False
+        self._maintenance_probe_after = 0.0
+        self._maintenance_lock = asyncio.Lock()
+
+    def _maintenance_error(self, path: str, request_id: str = "") -> MaintenanceError:
+        if not self.maintenance:
+            logger.warning("[WuwaTappoUID] 官方服务维护中，暂缓业务请求，每分钟探测恢复。")
+        self.maintenance = True
+        self._maintenance_probe_after = time.monotonic() + 60
+        return MaintenanceError(f"接口 {path}，HTTP 601，请求 ID {request_id or '未提供'}")
+
+    async def ensure_available(self) -> None:
+        if not self.maintenance:
+            return
+        async with self._maintenance_lock:
+            if not self.maintenance:
+                return
+            if time.monotonic() < self._maintenance_probe_after:
+                raise MaintenanceError()
+            self._maintenance_probe_after = time.monotonic() + 60
+            try:
+                await self._fetch_once(BASE + "/api/common/activity-config", "GET", None, "")
+            except MaintenanceError:
+                raise
+            except (NetworkError, ApiError, DataError) as error:
+                detail = error.details if isinstance(error, (NetworkError, ApiError)) else str(error)
+                raise MaintenanceError("维护恢复探测未成功：" + detail) from None
 
     def account_requests(self, token: str = "", cuid: str = "") -> AccountRequests:
         key = "cuid:" + cuid if cuid else "token:" + self._read_key(token)[0]
@@ -204,6 +232,8 @@ class WuwaAPI:
             raise
 
     async def _fetch_once(self, url: str, method: str, payload: object, token: str) -> Envelope:
+        if url != BASE + "/api/common/activity-config":
+            await self.ensure_available()
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         path = url.removeprefix(BASE).split("?", 1)[0]
         request_id = ""
@@ -212,6 +242,8 @@ class WuwaAPI:
             async with self.client().request(method, url, json=payload, headers=headers) as response:
                 request_id = response.headers.get("x-request-id", "")
                 status = response.status
+                if status == 601:
+                    raise self._maintenance_error(path, request_id)
                 try:
                     envelope = Envelope.model_validate_json(await response.text())
                 except ValidationError:
@@ -235,6 +267,10 @@ class WuwaAPI:
                     )
                 if response.status >= 400:
                     raise DataError(f"请求被拒绝（HTTP {response.status}），请管理员检查接口。")
+                if url == BASE + "/api/common/activity-config" and method == "GET":
+                    if self.maintenance:
+                        logger.info("[WuwaTappoUID] 官方服务维护结束，恢复业务请求。")
+                    self.maintenance = False
                 return envelope
         except (aiohttp.ClientError, TimeoutError) as error:
             raise NetworkError(
@@ -326,18 +362,6 @@ class WuwaAPI:
         if result is not True:
             raise DataError("token 续期接口未返回 true，原会话已保留。")
 
-    async def roles(self, cuid: str, domestic: int) -> list[RoleInfo]:
-        """不需要登录的角色查询；只读，可以随网络重试。"""
-        cache = _read_cache.get()
-        key = (cuid, domestic)
-        if cache is not None and cache.active and key in cache.roles:
-            return cache.roles[key]
-        data = await self.request("/api/auth/player/query", payload={"cuid": cuid, "is_domestic": domestic})
-        roles = parse(RoleQuery, data).items
-        if cache is not None and cache.active:
-            cache.roles[key] = roles
-        return roles
-
     async def me(self, token: str, *, fresh: bool = False) -> UserInfo:
         cache = _read_cache.get()
         key = self._read_key(token)
@@ -345,6 +369,7 @@ class WuwaAPI:
             return cache.users[key]
         info = parse(UserInfo, await self.request("/api/frontend/user/me", "GET", token=token))
         self.remember_account(token, str(info.cuid))
+        self._socket_rooms[key[0]] = str(info.room_no or info.id)
         if cache is not None and cache.active and key == self._read_key(token):
             cache.users[key] = info
         return info
@@ -394,6 +419,11 @@ class WuwaAPI:
 
     async def set_clicks(self, token: str, total: int, expires_at: float | None = None) -> int:
         """重连时仍提交同一个目标累计值；回读已达到目标就不再发送。"""
+        await self.ensure_available()
+        key = self._read_key(token)[0]
+        if key not in self._socket_rooms:
+            info = await self.me(token)
+            self._socket_rooms[key] = str(info.room_no or info.id)
         attempted = False
         rate_retries = 0
 
@@ -422,12 +452,18 @@ class WuwaAPI:
         return await retry_network(submit, "点击连接")
 
     async def _set_clicks_once(self, token: str, total: int, expires_at: float | None) -> int:
+        await self.ensure_available()
         self.invalidate(token)
         try:
             async with asyncio.timeout(15):
                 async with self.client().ws_connect(
                     BASE.replace("https://", "wss://") + "/socket.io/",
-                    params={"EIO": "4", "transport": "websocket", "token": token},
+                    params={
+                        "EIO": "4",
+                        "transport": "websocket",
+                        "token": token,
+                        "rm": self._socket_rooms[self._read_key(token)[0]],
+                    },
                     origin=ORIGIN,
                 ) as ws:
                     sent_connect = sent_clicks = False
@@ -445,7 +481,7 @@ class WuwaAPI:
                         elif message.startswith("40") and not sent_clicks:
                             if expires_at is not None and time.time() >= expires_at:
                                 raise Expired
-                            await ws.send_str("42" + json.dumps(["cr", {"num": total}], separators=(",", ":")) + ",1")
+                            await ws.send_str("421" + json.dumps(["cr", {"num": total}], separators=(",", ":")))
                             sent_clicks = True
                         elif message.startswith("42"):
                             event = JSON.validate_json(message[2:])
@@ -458,7 +494,10 @@ class WuwaAPI:
                             starts = [i for i in (message.find("["), message.find("{")) if i >= 0]
                             if not starts:
                                 raise DataError("点击确认帧缺少正文。")
-                            body = JSON.validate_json(message[min(starts) :])
+                            start = min(starts)
+                            if message[2:start] != "1":
+                                continue
+                            body = JSON.validate_json(message[start:])
                             if isinstance(body, list) and body:
                                 body = body[0]
                             if not isinstance(body, dict) or not isinstance(body.get("c"), int):
@@ -469,6 +508,8 @@ class WuwaAPI:
                             return code
         except aiohttp.WSServerHandshakeError as error:
             request_id = error.headers.get("x-request-id", "") if error.headers is not None else ""
+            if error.status == 601:
+                raise self._maintenance_error("/socket.io:connect", request_id) from None
             if error.status in (401, 403):
                 raise ApiError(
                     None, http_status=error.status, path="/socket.io:connect", request_id=request_id

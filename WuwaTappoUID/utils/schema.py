@@ -18,7 +18,6 @@ RENEW_WINDOW = 60 * 60
 AUTO_CLICKS = 10_000
 # 请求发出这么久后该侧冷却仍未推进，就判定那次开箱没有生效（HTTP 超时为 25 秒）。
 SETTLE_SECONDS = 120
-ASSET_MANIFEST_PATH = "/app/asset-json/appearance_asset.json"
 SIDE_NAMES = {"left": "左", "right": "右"}
 Side = Literal["left", "right"]
 
@@ -67,6 +66,14 @@ class NetworkError(WuwaError):
     def __init__(self, message: str, details: str = ""):
         super().__init__(message)
         self.details = details or message
+
+
+class MaintenanceError(WuwaError):
+    """官方维护中，暂缓请求，不计入账号或通知失败预算。"""
+
+    def __init__(self, details: str = ""):
+        super().__init__("官方服务正在维护，已暂缓操作，请稍后再试。")
+        self.details = details
 
 
 class DataError(WuwaError):
@@ -139,6 +146,7 @@ class UserInfo(BaseModel):
     player_id: str | int
     server_id: str | int
     is_domestic: Literal[0, 1] | None = None
+    room_no: str | int | None = None
     character: DesktopCharacter | None = None
     total_click_count: int
     total_click_consume: int

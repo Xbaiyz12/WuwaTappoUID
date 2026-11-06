@@ -13,13 +13,13 @@ from .api import JSON, Download, WuwaAPI, parse
 from .item_image import render_tile
 from .render_cache import RenderConfig, render_in_thread
 from .schema import (
-    ASSET_MANIFEST_PATH,
     AssetEntry,
     AssetManifest,
     DataError,
     DesktopCharacter,
     Dictionary,
     Item,
+    MaintenanceError,
     WuwaError,
 )
 from .settings import retry_limit
@@ -34,6 +34,10 @@ class Activity(BaseModel):
 
 class DictHost(BaseModel):
     url: dict[str, str]
+
+
+class AssetHost(BaseModel):
+    url: str
 
 
 class CacheHeaders(BaseModel):
@@ -59,6 +63,7 @@ class Resources:
         self.catalog: Catalog | None = None
         self.path = root / "dict_zh.json"
         self.manifest_path = root / "appearance_asset.json"
+        self.manifest_host_path = root / "appearance_asset_host.json"
         self.state_path = root / "resource_state.json"
         self.raw_dir = root / "item_originals"
         self.image_dir = root / "item_images"
@@ -143,6 +148,8 @@ class Resources:
         try:
             activity = parse(Activity, await self.api.request("/api/common/activity-config", "GET"))
             host = activity.assets_host.rstrip("/") or DEFAULT_HOST
+        except MaintenanceError:
+            raise
         except WuwaError as error:
             problems.append(f"活动配置未更新：{error} 继续使用已有资源站。")
         try:
@@ -164,7 +171,11 @@ class Resources:
         except (WuwaError, OSError, ValidationError) as error:
             problems.append(self._error("中文名称更新", error))
         try:
-            url = host + ASSET_MANIFEST_PATH
+            config_url = host + "/app/json-host/appearance_asset_host.json"
+            response = await self._json_file(config_url, self.manifest_host_path, force)
+            config = parse(AssetHost, JSON.validate_json(response.body))
+            await self._commit_json(config_url, self.manifest_host_path, response)
+            url = config.url
             response = await self._json_file(url, self.manifest_path, force or self.manifest is None)
             fresh_manifest = parse(AssetManifest, JSON.validate_json(response.body))
             if not fresh_manifest.images():
@@ -203,6 +214,8 @@ class Resources:
                 await asyncio.to_thread(self._write_file, self.catalog_path, catalog.model_dump_json().encode())
                 self.catalog = catalog
                 messages.append(f"图鉴目录已同步（{len(items)} 项）。")
+            except MaintenanceError:
+                raise
             except (WuwaError, OSError) as error:
                 problems.append(self._error("图鉴目录更新", error))
             updated, skipped, failed, deferred = await self._sync_images(force)

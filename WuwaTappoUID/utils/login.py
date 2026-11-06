@@ -153,6 +153,8 @@ class LoginManager:
                             account = Account(id=target, cuid=sdk.cuid, domestic=1)
                         token = await self.service.api.exchange_sdk_token(sdk, role, roles.channelId)
                         account.token = token.token
+                        account.role_info = roles.model_dump_json()
+                        account.roles_updated_at = time.time()
                         account.token_state = "pending"
                         account.token_expires_at = 0
                         account.token_renew_after = 0
