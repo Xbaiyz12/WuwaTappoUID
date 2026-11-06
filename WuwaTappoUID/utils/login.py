@@ -131,7 +131,7 @@ class LoginManager:
                         raise WuwaError("请先填写手机号和验证码后登录。")
                     row.status = "processing"
                     await Store.save(row)
-                    roles = await self.service.api.login_roles(sdk.cuid)
+                    roles = await self.service.api.login_roles(sdk)
                     role = next(
                         (
                             item

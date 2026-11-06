@@ -310,8 +310,14 @@ class WuwaAPI:
         self.remember_account(result.token, login.cuid)
         return result
 
-    async def login_roles(self, cuid: str) -> RoleQuery:
-        data = await self.request("/api/auth/player/query", payload={"cuid": cuid, "is_domestic": 1})
+    async def login_roles(self, login: SdkLogin) -> RoleQuery:
+        payload = {
+            "cuid": login.cuid,
+            "is_domestic": 1,
+            "accessToken": login.token,
+            "cname": login.username,
+        }
+        data = await self.request("/api/auth/player/query", payload=payload)
         return parse(RoleQuery, data)
 
     async def renew_token(self, token: str) -> None:
