@@ -20,7 +20,7 @@ from .api import WuwaAPI, with_read_cache
 from .cards import Cards, ResultContext
 from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
 from .failures import Failures
-from .formatting import account_text, date_text, mask_cuid, role_text, task_text
+from .formatting import account_text, date_text, mask_cuid, task_text
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
@@ -41,8 +41,6 @@ from .schema import (
     Item,
     MaintenanceError,
     NetworkError,
-    RoleInfo,
-    RoleQuery,
     Side,
     SynthesisResult,
     UserInfo,
@@ -193,11 +191,9 @@ class Service:
         if task is not None and task.status in ("active", "paused"):
             await Store.save(Notice(subscription_id=task.subscription_id, account_id=account.id, text=text))
 
-    async def account_reply(
-        self, account: Account, roles: list[RoleInfo], note: str, task: ChestTask | None, event: Event
-    ) -> list[str | bytes]:
+    async def account_reply(self, account: Account, task: ChestTask | None, event: Event) -> list[str | bytes]:
         try:
-            image = await self.cards.account_summary(account, roles, note, task, event)
+            image = await self.cards.account_summary(account, task, event)
         except SQLAlchemyError:
             raise
         except Exception:
@@ -205,8 +201,8 @@ class Service:
         else:
             return [image]
         info = UserInfo.model_validate_json(account.info)
-        summary = account_text(info, account.domestic, role_text(roles))
-        return ["账号数据已取得，图片暂不可用。\n" + summary + ("\n" + note if note else "") + "\n" + task_text(task)]
+        summary = account_text(info, account.domestic)
+        return ["账号数据已取得，图片暂不可用。\n" + summary + "\n" + task_text(task)]
 
     async def refresh(self, account: Account, *, fresh: bool = False) -> UserInfo:
         # 调用方进入账号锁前可能已读取绑定，锁内以数据库中最新 token 为准。
@@ -218,8 +214,6 @@ class Service:
             account.token_renew_after = saved.token_renew_after
             account.token_state = saved.token_state
             account.info = saved.info
-            account.role_info = saved.role_info
-            account.roles_updated_at = saved.roles_updated_at
             account.verified_at = saved.verified_at
         if account.token_state == "expired":
             raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
@@ -355,10 +349,9 @@ class Service:
                     detail = self.error_detail(error)
                     logger.error(f"[WuwaTappoUID] token更新成功但任务恢复失败：{detail}")
                     resume_note = f"登录成功，但任务尚未恢复：{detail}；可稍后用 wt恢复。"
-                roles, role_note = await self.role_details(account)
                 task = await Store.task(account.id)
         await self.flush_notices()
-        reply = await self.account_reply(account, roles, role_note, task, event)
+        reply = await self.account_reply(account, task, event)
         notice = "token 登录成功，已绑定为当前账号。\n" + resume_note
         return [notice, *reply]
 
@@ -504,28 +497,14 @@ class Service:
                     record.notice_id = notice.id
                 await Store.save(*batch, notice)
 
-    async def role_details(self, account: Account) -> tuple[list[RoleInfo], str]:
-        """读取上次 SDK 登录的角色资料，不再发送缺少凭据的查询。"""
-        region = "国服" if account.domestic else "海外"
-        if account.role_info:
-            roles = RoleQuery.model_validate_json(account.role_info).items
-            note = f"角色资料来自上次登录：{date_text(account.roles_updated_at)}"
-            return roles[:3], note if roles else f"{region}下未查到游戏角色。{note}"
-        info = UserInfo.model_validate_json(account.info) if account.info else None
-        note = "角色详细资料将在下次 wt登录 时更新。"
-        if info is not None and str(info.player_id) not in ("", "0"):
-            return [RoleInfo(playerId=info.player_id, serverId=str(info.server_id))], note
-        return [], note
-
     async def info(self, event: Event) -> list[str | bytes]:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
-                await self.refresh(account)
-                roles, role_note = await self.role_details(account)
+                await self.refresh(account, fresh=True)
                 task = await Store.task(account.id)
         await self.flush_notices()
-        reply = await self.account_reply(account, roles, role_note, task, event)
+        reply = await self.account_reply(account, task, event)
         return reply
 
     async def query(self, event: Event, bag: bool = False, kind: str | None = None) -> list[str | bytes]:

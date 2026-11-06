@@ -20,7 +20,7 @@ from .render_cache import LocalImage, render_in_thread
 from .render_common import Header, Progress
 from .reply_card import TaskSnapshot, render_account, render_clicks, render_task
 from .resources import Resources
-from .schema import ApiError, Item, NetworkError, OpenResult, RoleInfo, RoleQuery, SynthesisResult, UserInfo, WuwaError
+from .schema import ApiError, Item, NetworkError, OpenResult, SynthesisResult, UserInfo, WuwaError
 
 KINDS = {"character": "角色", "accessory": "配件", "emote": "表情"}
 RESULT_PAGE_SIZE = 40
@@ -175,9 +175,6 @@ class Cards:
                     logger.warning(f"[WuwaTappoUID] 聊天头像暂不可用：{type(error).__name__}")
         info = UserInfo.model_validate_json(account.info) if account.info else None
         uid = str(info.player_id) if info and info.player_id else ""
-        if uid in ("", "0") and account.role_info:
-            roles = RoleQuery.model_validate_json(account.role_info).items
-            uid = str(roles[0].playerId) if roles else ""
         return Header(nickname=nickname, uid=uid if uid != "0" else "", available=available, avatar=face)
 
     def progress(self, items: list[Item]) -> list[Progress]:
@@ -225,8 +222,6 @@ class Cards:
     async def account_summary(
         self,
         account: Account,
-        roles: list[RoleInfo],
-        role_note: str,
         task: ChestTask | None,
         event: Event,
     ) -> bytes:
@@ -240,8 +235,6 @@ class Cards:
             info,
             mask_cuid(account.cuid),
             account.domestic,
-            roles,
-            role_note,
             snapshot,
             account.subscribed,
             desktop_avatar,

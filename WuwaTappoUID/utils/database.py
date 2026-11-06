@@ -28,8 +28,6 @@ class Account(SQLModel, table=True):
     domestic: int
     token: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
     info: str = Field(default="", sa_column=Column(Text, nullable=False))
-    role_info: str = Field(default="", sa_column=Column(Text, nullable=False))
-    roles_updated_at: float = 0
     verified_at: float = 0
     token_expires_at: float = 0
     token_renew_after: float = 0
@@ -164,8 +162,6 @@ ADDED_COLUMNS = {
         "external_synced": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
     "wt_account": {
-        "role_info": "TEXT NOT NULL DEFAULT ''",
-        "roles_updated_at": "FLOAT NOT NULL DEFAULT 0",
         "subscribed": "BOOLEAN NOT NULL DEFAULT FALSE",
         "token_expires_at": "FLOAT NOT NULL DEFAULT 0",
         "token_renew_after": "FLOAT NOT NULL DEFAULT 0",

@@ -153,17 +153,12 @@ class LoginManager:
                             account = Account(id=target, cuid=sdk.cuid, domestic=1)
                         token = await self.service.api.exchange_sdk_token(sdk, role, roles.channelId)
                         account.token = token.token
-                        account.role_info = roles.model_dump_json()
-                        account.roles_updated_at = time.time()
                         account.token_state = "pending"
                         account.token_expires_at = 0
                         account.token_renew_after = 0
                         row.status = "verifying"
                         row.account_id = target
                         row.token_digest = session_key(token.token)
-                        row.result = json.dumps(
-                            {"player_name": role.playerName if role is not None else "漂泊者"}, ensure_ascii=False
-                        )
                         await Store.save(account, row)
                         # 先落盘新token；期限解析失败也不得丢弃它或重新交换。
                         account.token_expires_at = token_expiry(token.expire_time)
@@ -210,7 +205,7 @@ class LoginManager:
                         {
                             "cuid": mask_cuid(account.cuid),
                             "region": "国服",
-                            "player_name": json.loads(row.result)["player_name"],
+                            "player_name": info.display_name,
                             "task_note": note,
                         },
                         ensure_ascii=False,

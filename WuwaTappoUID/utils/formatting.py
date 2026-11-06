@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from .database import ChestTask
 from .resources import Resources
-from .schema import CN_SERVER_ID, NET_SERVER_IDS, SIDE_NAMES, Item, OpenResult, RoleInfo, Side, UserInfo
+from .schema import SIDE_NAMES, Item, OpenResult, Side, UserInfo
 
 CHINA = timezone(timedelta(hours=8))
 PAUSE_REASONS = {"manual": "手动暂停", "auth": "登录态失效", "failure": "连续失败"}
@@ -37,32 +37,15 @@ def counts(info: UserInfo) -> str:
     return f"累计点击：{info.total_click_count}\n已消耗点击：{info.total_click_consume}\n剩余可用点击：{info.remaining}"
 
 
-def server_name(server_id: str) -> str:
-    if server_id == CN_SERVER_ID:
-        return "国服"
-    if server_id in NET_SERVER_IDS:
-        return "海外服"
-    return f"未知服务器 {server_id[:8]}" if server_id else "未知服务器"
-
-
-def role_text(roles: list[RoleInfo]) -> list[str]:
-    lines = []
-    for role in roles[:3]:
-        level = f" Lv{role.level}" if role.level is not None else ""
-        lines.append(f"角色：{role.playerName or '未命名'}{level}（{server_name(role.serverId)}）")
-        lines.append(f"角色 ID：{role.playerId}")
-    return lines
-
-
-def account_text(info: UserInfo, domestic: int, roles: list[str]) -> str:
-    # user/me 的昵称与角色字段只回显登录时提交的占位值，角色信息改由角色查询接口提供。
+def account_text(info: UserInfo, domestic: int) -> str:
     now = time.time()
     cooldowns = []
     for side in ("left", "right"):
         stamp = info.cooldown(side)
         cooldowns.append(f"{SIDE_NAMES[side]}宝箱：" + (date_text(stamp) if stamp > now else "已可开启"))
     region = f"CUID：{mask_cuid(info.cuid)}（{'国服' if domestic else '海外'}）"
-    return "\n".join([*roles, region, counts(info), *cooldowns])
+    uid = [f"UID：{info.player_id}"] if str(info.player_id) not in ("", "0") else []
+    return "\n".join([f"账号昵称：{info.display_name}", *uid, region, counts(info), *cooldowns])
 
 
 def task_text(task: ChestTask | None) -> str:

@@ -154,6 +154,10 @@ class UserInfo(BaseModel):
     right_treasure_chest: int
 
     @property
+    def display_name(self) -> str:
+        return (self.nickname or "").strip() or "漂泊者"
+
+    @property
     def remaining(self) -> int:
         return self.total_click_count - self.total_click_consume
 
@@ -192,7 +196,7 @@ class Dictionary(BaseModel):
 
 
 class RoleInfo(BaseModel):
-    """角色查询接口的一项；只取展示需要的字段。"""
+    """登录前角色查询接口的一项。"""
 
     playerId: int | str
     playerName: str = ""

@@ -30,7 +30,7 @@ from .render_common import (
 from .render_common import (
     footer as draw_footer,
 )
-from .schema import RoleInfo, UserInfo
+from .schema import UserInfo
 
 GREEN = (107, 142, 106)
 PALE_GREEN = (231, 239, 216)
@@ -168,45 +168,27 @@ def render_account(
     info: UserInfo,
     cuid: str,
     domestic: int,
-    roles: list[RoleInfo],
-    role_note: str,
     task: TaskSnapshot | None,
     subscribed: bool,
     desktop_avatar: bytes | None,
 ) -> bytes:
     now = time.time()
-    extra = max(0, len(roles) - 1) * 64 if roles else 40
-    canvas, draw = base(profile, "账号信息", 757 + extra)
-    panel(canvas, 36, 222, 828, 94 + extra)
+    canvas, draw = base(profile, "账号信息", 757)
+    panel(canvas, 36, 222, 828, 94)
     if desktop_avatar is not None:
         with Image.open(io.BytesIO(desktop_avatar)) as opened, opened.convert("RGBA") as picture:
             with picture.crop(picture.getbbox()) as cropped, fit(cropped, s(76), s(76)) as icon:
                 canvas.alpha_composite(icon, (s(60) + (s(76) - icon.width) // 2, s(231) + (s(76) - icon.height) // 2))
     else:
         text(draw, 98, 256, "头像暂不可用" if info.character is not None else "未设置", 13, SOFT, align="center")
-    if roles:
-        role = roles[0]
-        name_right = text(
-            draw, 154, 249, role.playerName or "未命名", 25, line=36, rounded=False, weight=700, limit=270
-        )
-        if role.level is not None:
-            text(draw, name_right + 16, 256, f"Lv.{role.level}", 17, SOFT, line=26)
-        for index, role in enumerate(roles[1:], 1):
-            top = 316 + (index - 1) * 64
-            rule(draw, 60, top, 840, top)
-            label = role.playerName or "未命名"
-            if role.level is not None:
-                label += f" · Lv.{role.level}"
-            text(draw, 62, top + 17, label, 18, limit=440)
-            text(draw, 838, top + 20, f"UID {role.playerId}", 14, SOFT, align="right")
-    else:
-        text(draw, 154, 258, "暂未获取角色", 22, SOFT, limit=280)
-        text(draw, 60, 323, role_note, 14, SOFT, limit=780)
+    text(draw, 154, 249, info.display_name, 25, line=36, rounded=False, weight=700, limit=270)
+    if str(info.player_id) not in ("", "0"):
+        text(draw, 154, 289, f"UID {info.player_id}", 13, SOFT, limit=550)
     text(draw, 840, 245, f"CUID {cuid}", 18, align="right", limit=278)
     text(draw, 840, 278, "国服" if domestic else "海外", 14, SOFT, align="right")
-    stats(canvas, draw, 332 + extra, info)
+    stats(canvas, draw, 332, info)
     for index, side in enumerate(("left", "right")):
-        x, top = 36 + 422 * index, 474 + extra
+        x, top = 36 + 422 * index, 474
         panel(canvas, x, top, 406, 106)
         text(draw, x + 24, top + 12, "左侧宝箱" if side == "left" else "右侧宝箱", 15, SOFT)
         available_at = info.cooldown(side)
@@ -216,7 +198,7 @@ def render_account(
         else:
             text(draw, x + 24, top + 42, "已可开启", 28, GREEN, line=38)
             draw.ellipse((s(x + 362), s(top + 51), s(x + 372), s(top + 61)), fill=GREEN)
-    top = 596 + extra
+    top = 596
     panel(canvas, 36, top, 828, 89)
     text(draw, 61, top + 13, "自动开箱", 16)
     state = task.state(now) if task is not None else "未开启"
@@ -229,7 +211,7 @@ def render_account(
         text(draw, 838, top + 52, deadline, 15, SOFT, align="right", limit=236)
     else:
         text(draw, 61, top + 52, "发送 wt宝箱 开启新任务", 16, SOFT)
-    footer(draw, 705 + extra)
+    footer(draw, 705)
     return finish(canvas)
 
 
