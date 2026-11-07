@@ -53,9 +53,8 @@ def donut(draw: ImageDraw.ImageDraw, stats: ChestStatistics) -> None:
         angle = end
     draw.ellipse((s(cx - inner), s(cy - inner), s(cx + inner), s(cy + inner)), fill=PANEL)
     text = f"{stats.total:,}"
-    size = 56
-    while size > 18 and width_of(runs(text, size)) > s(158):
-        size -= 1
+    text_width = width_of(runs(text, 56))
+    size = min(56, max(18, int(56 * s(158) / text_width)))
     draw_text(draw, cx, 354, 74, text, size, BROWN, align="center")
     draw_text(draw, cx, 426, 26, "累计开箱", 19, BROWN, align="center")
 

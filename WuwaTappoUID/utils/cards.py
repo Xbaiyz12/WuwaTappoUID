@@ -334,16 +334,18 @@ class Cards:
             role_ids = {key for key, name in roles.items() if name == filters.role}
             if not role_ids:
                 raise WuwaError(f"未找到角色“{filters.role}”，请使用完整角色名，例如 角色=今汐。")
+        catalog = self.catalog
         selected = []
         for item in items:
-            entry = self.catalog.get(str(item.asset_id))
-            rarity = str(item.rarity or (entry.rarity if entry is not None else "")).strip().lower()
             if item.quantity <= 0:
                 continue
             if filters.kind and self.kind(item.asset_id, item.asset_type) != filters.kind:
                 continue
-            if filters.rarity and rarity != filters.rarity:
-                continue
+            if filters.rarity:
+                entry = catalog.get(str(item.asset_id))
+                rarity = str(item.rarity or (entry.rarity if entry is not None else "")).strip().lower()
+                if rarity != filters.rarity:
+                    continue
             if filters.duplicates and item.quantity <= 1:
                 continue
             if role_ids is not None and self.item_role(item) not in role_ids:

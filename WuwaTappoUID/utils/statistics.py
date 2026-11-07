@@ -52,14 +52,15 @@ class ChestStatistics:
         return self.total - self.missing
 
     @classmethod
-    def aggregate(cls, payloads: list[str]) -> "ChestStatistics":
+    def aggregate(cls, groups: list[tuple[str, int]]) -> "ChestStatistics":
         counts = dict.fromkeys(RARITIES, 0)
         quantities: Counter[str] = Counter()
         items: dict[str, OpenResult] = {}
-        missing = clicks = 0
-        for payload in payloads:
+        total = missing = clicks = 0
+        for payload, count in groups:
+            total += count
             if not payload:
-                missing += 1
+                missing += count
                 continue
             try:
                 result = OpenResult.model_validate_json(payload)
@@ -68,10 +69,10 @@ class ChestStatistics:
             rarity = str(result.rarity_type).strip().lower()
             if rarity not in counts:
                 raise DataError("历史开箱流水含未识别的稀有度，请管理员检查记录。")
-            counts[rarity] += 1
-            clicks += result.click_consume
+            counts[rarity] += count
+            clicks += result.click_consume * count
             key = str(result.asset_id)
-            quantities[key] += 1
+            quantities[key] += count
             items[key] = result
         top = [(items[key], count) for key, count in quantities.most_common(5)]
-        return cls(len(payloads), missing, counts, clicks, top)
+        return cls(total, missing, counts, clicks, top)

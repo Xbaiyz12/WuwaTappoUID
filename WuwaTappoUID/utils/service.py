@@ -640,8 +640,8 @@ class Service:
     async def chest_statistics(self, event: Event, period: StatisticsPeriod) -> list[str | bytes]:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
             _, account = await self.bound(event, allow_expired=True)
-            first_at, payloads = await Store.chest_history(account.id, period.since, period.until)
-        stats = await asyncio.to_thread(ChestStatistics.aggregate, payloads)
+            first_at, groups = await Store.chest_history(account.id, period.since, period.until)
+        stats = await asyncio.to_thread(ChestStatistics.aggregate, groups)
         return [await self.cards.chest_statistics(account, event, period, stats, first_at)]
 
     async def synthesize(self, event: Event, same_level: bool = False) -> list[str | bytes]:

@@ -453,15 +453,17 @@ class Store:
     @with_read_session
     async def chest_history(
         cls, session: AsyncSession, account_id: str, since: float, until: float
-    ) -> tuple[float | None, list[str]]:
+    ) -> tuple[float | None, list[tuple[str, int]]]:
         conditions = (col(ChestRecord.account_id) == account_id, col(ChestRecord.state) == "success")
         first_at = await session.scalar(select(func.min(col(ChestRecord.created_at))).where(*conditions))
         result = await session.execute(
-            select(col(ChestRecord.result))
+            # 相同物品结果先在数据库计数，避免全部历史逐条加载和解析。
+            select(col(ChestRecord.result), func.count())
             .where(*conditions, col(ChestRecord.created_at) >= since, col(ChestRecord.created_at) <= until)
-            .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
+            .group_by(col(ChestRecord.result))
+            .order_by(func.min(col(ChestRecord.created_at)), col(ChestRecord.result))
         )
-        return first_at, list(result.scalars().all())
+        return first_at, [(payload, count) for payload, count in result.all()]
 
     @classmethod
     @with_read_session
