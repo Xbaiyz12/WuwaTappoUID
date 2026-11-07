@@ -38,7 +38,7 @@ def highest_tiers(atlas: list[Item]) -> dict[str, str]:
 def next_recipe(items: list[Item], highest: dict[str, str], *, same_level: bool = False) -> Recipe | None:
     groups: dict[tuple[str, str], list[Item]] = {}
     for item in items:
-        if item.quantity > 1:
+        if item.quantity > 1 and not item.is_collect:
             groups.setdefault(category(item), []).append(item)
     cost = 5 if same_level else 10
     for kind in KINDS:

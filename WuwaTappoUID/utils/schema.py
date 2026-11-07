@@ -43,6 +43,9 @@ class ApiError(WuwaError):
             70006: "宝箱仍在冷却（70006）",
             50002: "合成失败（50002）",
             50006: "未拥有该物品（50006）",
+            60002: "兑换失败（60002）",
+            60003: "已使用过该兑换码（60003）",
+            60004: "该兑换码无效（60004）",
         }
         message = (
             f"请求鉴权被拒绝（HTTP {http_status}，无业务错误码）"
@@ -173,6 +176,8 @@ class Item(BaseModel):
     asset_type: str = "其他"
     quantity: int = 1
     rarity: str | int | None = None
+    role_id: str | int = 0
+    is_collect: Literal[0, 1] = 0
 
 
 class OpenResult(BaseModel):

@@ -400,6 +400,10 @@ class WuwaAPI:
         except ValidationError:
             raise DataError("图鉴响应格式已变化，无法确定各品类的最高合成阶级。") from None
 
+    async def redeem(self, token: str, code: str) -> None:
+        self.invalidate(token)
+        await self.request("/api/frontend/redeems/use", payload={"code": code}, token=token, retry=False)
+
     async def synthesize(self, token: str, asset_ids: list[int], same_level: bool) -> SynthesisResult:
         self.invalidate(token)
         path = "/api/frontend/assets/synthesis" + ("/same-level" if same_level else "")

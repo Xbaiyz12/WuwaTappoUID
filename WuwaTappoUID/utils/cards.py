@@ -2,8 +2,10 @@
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
 from gsuid_core.logger import logger
@@ -13,6 +15,7 @@ from pydantic import BaseModel
 from .api import WuwaAPI
 from .atlas_card import RARITIES as ATLAS_RARITIES
 from .atlas_card import AtlasGroup, AtlasItem, render_atlas_card
+from .backpack import BagFilter
 from .chest_card import Card, render_chest_card
 from .database import Account, ChestRecord, ChestTask, Store
 from .formatting import mask_cuid
@@ -21,6 +24,8 @@ from .render_common import Header, Progress
 from .reply_card import TaskSnapshot, render_account, render_clicks, render_task
 from .resources import Resources
 from .schema import ApiError, Item, NetworkError, OpenResult, SynthesisResult, UserInfo, WuwaError
+from .statistics import CHINA, ChestStatistics, StatisticsPeriod
+from .statistics_card import render_statistics
 
 KINDS = {"character": "角色", "accessory": "配件", "emote": "表情"}
 RESULT_PAGE_SIZE = 40
@@ -32,10 +37,12 @@ class CatalogEntry(BaseModel):
     name: str
     type: str
     rarity: str
+    role: int | str = 0
 
 
 class BundledCatalog(BaseModel):
     items: list[CatalogEntry]
+    roles: dict[str, str]
 
 
 @dataclass
@@ -50,6 +57,7 @@ class Cards:
         self.resources = resources
         catalog = BundledCatalog.model_validate_json(CATALOG_PATH.read_bytes())
         self._bundled_catalog = {str(item.asset): item for item in catalog.items}
+        self._bundled_roles = catalog.roles
         self._catalog_source: tuple[int, int] | None = None
         self._catalog_map: dict[str, CatalogEntry] = {}
         self._catalog_types: dict[str, list[CatalogEntry]] = {}
@@ -70,6 +78,7 @@ class Cards:
                     name=self.resources.name(item.asset_name, item.asset_id),
                     type="character" if item.asset_type == "character_skin" else item.asset_type,
                     rarity=str(item.rarity).lower(),
+                    role=item.role_id,
                 )
                 for item in live.items
             }
@@ -112,6 +121,10 @@ class Cards:
     def _read_images(paths: dict[str, Path]) -> dict[str, bytes]:
         return {key: path.read_bytes() for key, path in paths.items() if path.exists()}
 
+    def item_name(self, asset_id: str | int, raw: str | None = None) -> str:
+        entry = self.catalog.get(str(asset_id))
+        return entry.name if entry is not None and entry.name else self.resources.name(raw, asset_id)
+
     async def item_cards(self, items: list[Item], *, lazy: bool = False) -> list[Card]:
         catalog = self.catalog
         manifest = self.resources.manifest
@@ -120,9 +133,7 @@ class Cards:
         for item in items:
             key = str(item.asset_id)
             entry = catalog[key] if key in catalog else None
-            name = (
-                entry.name if entry is not None and entry.name else self.resources.name(item.asset_name, item.asset_id)
-            )
+            name = self.item_name(item.asset_id, item.asset_name)
             rarity = str(item.rarity or (entry.rarity if entry is not None else "common")).lower()
             cards.append(Card(name=name, rarity=rarity, kind=self.kind(key, item.asset_type)))
             if manifest is not None:
@@ -304,18 +315,59 @@ class Cards:
         header = replace(context.header, available=available)
         return await self.draw(header, "开箱结果", cards, note, context.progress)
 
-    async def backpack(self, account: Account, items: list[Item], event: Event, kind: str | None = None) -> list[bytes]:
+    def item_role(self, item: Item) -> str:
+        role = str(item.role_id).strip()
+        if role and role != "0":
+            return role
+        match = re.fullmatch(r"(?:role|emote)_(\d+)_[a-z0-9]+(?:\.png)?", item.asset_name or "", re.I)
+        if match:
+            return match[1]
+        entry = self.catalog.get(str(item.asset_id))
+        return str(entry.role) if entry is not None else "0"
+
+    def filter_bag(self, items: list[Item], filters: BagFilter) -> list[Item]:
+        role_ids: set[str] | None = None
+        if filters.role:
+            roles = dict(self._bundled_roles)
+            if self.resources.dictionary is not None:
+                roles.update(self.resources.dictionary.character)
+            role_ids = {key for key, name in roles.items() if name == filters.role}
+            if not role_ids:
+                raise WuwaError(f"未找到角色“{filters.role}”，请使用完整角色名，例如 角色=今汐。")
+        selected = []
+        for item in items:
+            entry = self.catalog.get(str(item.asset_id))
+            rarity = str(item.rarity or (entry.rarity if entry is not None else "")).strip().lower()
+            if item.quantity <= 0:
+                continue
+            if filters.kind and self.kind(item.asset_id, item.asset_type) != filters.kind:
+                continue
+            if filters.rarity and rarity != filters.rarity:
+                continue
+            if filters.duplicates and item.quantity <= 1:
+                continue
+            if role_ids is not None and self.item_role(item) not in role_ids:
+                continue
+            selected.append(item)
+        return selected
+
+    async def backpack(
+        self, account: Account, items: list[Item], event: Event, filters: BagFilter | None = None
+    ) -> list[bytes]:
+        filters = filters or BagFilter()
+        selected = self.filter_bag(items, filters)
+        if filters.description and not selected:
+            raise WuwaError(f"没有符合条件的背包物品：{filters.description}。")
         info = UserInfo.model_validate_json(account.info)
         header = await self.header(account, info.remaining, event)
         progress = self.progress(items)
         header.available = None
         header.collected = (sum(row.owned for row in progress), sum(row.total for row in progress))
-        groups: dict[str, list[Item]] = {name: [] for name in KINDS} if kind is None else {kind: []}
-        for item in items:
-            if item.quantity > 0:
-                item_kind = self.kind(item.asset_id, item.asset_type)
-                if kind is None or item_kind == kind:
-                    groups.setdefault(item_kind, []).append(item)
+        groups: dict[str, list[Item]] = {name: [] for name in KINDS} if filters.kind is None else {filters.kind: []}
+        for item in selected:
+            groups.setdefault(self.kind(item.asset_id, item.asset_type), []).append(item)
+        if filters.description:
+            groups = {kind: entries for kind, entries in groups.items() if entries}
         images = []
         for kind, entries in groups.items():
             cards = [
@@ -336,16 +388,45 @@ class Cards:
                 if (selection := [card for card in cards if card.rarity == rarity])
             ]
             duplicates = sum(card.quantity - 1 for card in cards)
+            note = f"共 {len(cards)} 项    重复 {duplicates} 项"
+            if filters.description:
+                note = f"筛选：{filters.description}    {note}"
             images.append(
                 await self.draw_atlas(
                     header,
                     f"背包 · {KINDS.get(kind, kind or '其他')}",
                     rarity_groups,
                     progress,
-                    f"共 {len(cards)} 项    重复 {duplicates} 项",
+                    note,
                 )
             )
         return images
+
+    async def redeemed(self, account: Account, items: list[Item], event: Event) -> list[bytes]:
+        info = UserInfo.model_validate_json(account.info)
+        info_header = await self.header(account, info.remaining, event)
+        cards = await self.item_cards(items)
+        for card, item in zip(cards, items, strict=True):
+            card.quantity = item.quantity
+        return [
+            await self.draw(
+                info_header, "兑换获得", cards[offset : offset + RESULT_PAGE_SIZE], "兑换前后背包增加的物品"
+            )
+            for offset in range(0, len(cards), RESULT_PAGE_SIZE)
+        ]
+
+    async def chest_statistics(
+        self, account: Account, event: Event, period: StatisticsPeriod, stats: ChestStatistics, first_at: float | None
+    ) -> bytes:
+        info_header = await self.header(account, None, event)
+        top = [
+            (self.item_name(item.asset_id, item.asset_name), str(item.rarity_type).strip().lower(), count)
+            for item, count in stats.top
+        ]
+        coverage = "仅统计本插件记录"
+        if first_at is not None:
+            coverage += f" · 记录始于 {datetime.fromtimestamp(first_at, CHINA):%Y.%m.%d}"
+        return await render_in_thread(render_statistics, info_header, period.caption(first_at), stats, top, coverage)
 
     async def draw_atlas(
         self, header: Header, title: str, groups: list[AtlasGroup], progress: list[Progress], note: str = ""

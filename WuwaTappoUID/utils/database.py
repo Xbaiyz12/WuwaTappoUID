@@ -124,6 +124,7 @@ class ChestRecord(SQLModel, table=True):
     __table_args__ = (
         Index("ix_wt_chest_record_pending", "state", "notice_id", "account_id"),
         Index("ix_wt_chest_record_recent", "account_id", "run_id", "side", "created_at"),
+        Index("ix_wt_chest_record_history", "account_id", "created_at"),
         {"extend_existing": True},
     )
     id: str = Field(default_factory=new_id, primary_key=True, max_length=32)
@@ -447,6 +448,20 @@ class Store:
         result = await session.execute(select(ChestRecord).where(col(ChestRecord.id).in_(ids)))
         rows = {row.id: row for row in result.scalars().all()}
         return [rows[key] for key in ids]
+
+    @classmethod
+    @with_read_session
+    async def chest_history(
+        cls, session: AsyncSession, account_id: str, since: float, until: float
+    ) -> tuple[float | None, list[str]]:
+        conditions = (col(ChestRecord.account_id) == account_id, col(ChestRecord.state) == "success")
+        first_at = await session.scalar(select(func.min(col(ChestRecord.created_at))).where(*conditions))
+        result = await session.execute(
+            select(col(ChestRecord.result))
+            .where(*conditions, col(ChestRecord.created_at) >= since, col(ChestRecord.created_at) <= until)
+            .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
+        )
+        return first_at, list(result.scalars().all())
 
     @classmethod
     @with_read_session

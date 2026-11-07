@@ -14,9 +14,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from ..runtime import login, resources, service
 from ..utils.api import with_read_cache
+from ..utils.backpack import BagFilter
 from ..utils.help_card import help_text, render_bytes
 from ..utils.render_cache import HelpImageCache
 from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
+from ..utils.statistics import StatisticsPeriod
 
 sv = SV("WuwaTappo账号与宝箱", pm=6)
 register_help("WuwaTappoUID", f"{get_plugin_available_prefix('WuwaTappoUID')}帮助")
@@ -40,6 +42,8 @@ COMMANDS = (
     "背包",
     "图鉴",
     "合成",
+    "兑换",
+    "开箱统计",
     "增加次数",
     "次数",
     "宝箱",
@@ -103,18 +107,22 @@ async def wt_command(bot: Bot, event: Event) -> None:
                 raise WuwaError("用法：wt合成（默认升阶）、wt合成 升阶，或 wt合成 同阶。")
             mode = argument or "升阶"
             await service.bound(event)
-            await bot.send(f"开始{mode}合成多余物品：每种保留 1 件，本轮只进行{mode}合成。")
+            await bot.send(f"开始{mode}合成多余物品：跳过收藏，每种保留 1 件，本轮只进行{mode}合成。")
             replies = await service.synthesize(event, same_level=mode == "同阶")
-        elif command in ("背包", "图鉴"):
+        elif command == "兑换":
+            if not argument or len(argument.split()) != 1:
+                raise WuwaError("用法：wt兑换 CODE，为当前账号使用一个兑换码。")
+            replies = await service.redeem(event, argument)
+        elif command == "开箱统计":
+            replies = await service.chest_statistics(event, StatisticsPeriod.parse(argument))
+        elif command == "背包":
+            replies = await service.query(event, bag=True, filters=BagFilter.parse(argument))
+        elif command == "图鉴":
             kinds = {"角色": "character", "配件": "accessory", "表情": "emote"}
             if argument and argument not in kinds:
                 raise WuwaError(f"用法：wt{command} [角色/配件/表情]；不带参数查看全部分类。")
             kind = kinds[argument] if argument else None
-            replies = (
-                await service.query(event, bag=True, kind=kind)
-                if command == "背包"
-                else await service.atlas(event, kind)
-            )
+            replies = await service.atlas(event, kind)
         elif argument:
             raise WuwaError("这条命令不需要参数，可发送 wt帮助 查看用法。")
         elif command == "查看":

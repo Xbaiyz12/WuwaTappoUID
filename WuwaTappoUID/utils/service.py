@@ -14,9 +14,12 @@ from gsuid_core.logger import logger
 from gsuid_core.models import Event, Message
 from gsuid_core.segment import MessageSegment
 from gsuid_core.subscribe import gs_subscribe
+from gsuid_core.utils.database.base_models import DatabaseWriteTimeout
+from gsuid_core.utils.database.write_gate import WriteGateTimeout
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 
 from .api import WuwaAPI, with_read_cache
+from .backpack import BagFilter
 from .cards import Cards, ResultContext
 from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
 from .failures import Failures
@@ -50,6 +53,7 @@ from .schema import (
     token_expiry,
 )
 from .settings import bot_name, chest_task_hours, max_click_increment, retry_limit
+from .statistics import ChestStatistics, StatisticsPeriod
 from .synthesis import highest_tiers, next_recipe
 
 NOTICE_CACHE_BYTES = 32 * 1024 * 1024
@@ -543,7 +547,7 @@ class Service:
         reply = await self.account_reply(account, task, event)
         return reply
 
-    async def query(self, event: Event, bag: bool = False, kind: str | None = None) -> list[str | bytes]:
+    async def query(self, event: Event, bag: bool = False, filters: BagFilter | None = None) -> list[str | bytes]:
         owner = identity(event.bot_id, event.user_id)
         async with self.user_lock(owner):
             _, account = await self.bound(event)
@@ -552,7 +556,7 @@ class Service:
                 items = await self.read_bag(account) if bag else None
         # 绘图只读取本次快照，不占用自动开箱所需的账号锁。
         if items is not None:
-            answer: list[str | bytes] = list(await self.cards.backpack(account, items, event, kind))
+            answer: list[str | bytes] = list(await self.cards.backpack(account, items, event, filters))
         else:
             image = await self.cards.click_summary(account, event)
             answer = [image]
@@ -578,6 +582,67 @@ class Service:
                 raise
             await self.refresh(account, fresh=True)
             raise
+
+    async def redeem(self, event: Event, code: str) -> list[str | bytes]:
+        async with self.user_lock(identity(event.bot_id, event.user_id)):
+            _, account = await self.bound(event)
+            async with self.account_lock(account.id):
+                before_info = await self.refresh(account, fresh=True)
+                before_items = await self.read_bag(account, fresh=True)
+                try:
+                    await self.api.redeem(account.token, code)
+                except ApiError as error:
+                    if error.is_auth:
+                        await self.refresh(account, fresh=True)
+                    raise
+                except MaintenanceError:
+                    raise
+                except WuwaError as error:
+                    logger.warning(f"[WuwaTappoUID] 兑换结果未确认：{self.error_detail(error)}")
+                    return [f"兑换结果尚未确认：{error}。本次未自动重发，请用 wt背包、wt次数 核对实际变化。"]
+                # 从这里起官方已确认兑换成功，后续故障不得提示成兑换失败。
+                try:
+                    after_info = await self.refresh(account, fresh=True)
+                    after_items = await self.read_bag(account, fresh=True)
+                except SQLAlchemyError as error:
+                    await self.disable_database(error)
+                    return ["兑换成功，但结果刷新失败。\n" + self.database_error]
+                except (DatabaseWriteTimeout, WriteGateTimeout):
+                    return ["兑换成功，但数据库写入超时，结果未能完成刷新。请稍后用 wt背包、wt次数 查看。"]
+                except WuwaError as error:
+                    logger.warning(f"[WuwaTappoUID] 兑换成功但结果刷新失败：{self.error_detail(error)}")
+                    return [f"兑换成功，但结果刷新失败：{error}。请稍后用 wt背包、wt次数 查看。"]
+                except Exception as error:
+                    logger.exception("[WuwaTappoUID] 兑换成功后刷新出现意外错误")
+                    return [f"兑换成功，但结果刷新异常（{type(error).__name__}），已记录。请用 wt背包、wt次数 查看。"]
+                before = {str(item.asset_id): item.quantity for item in before_items}
+                gains = [
+                    item.model_copy(update={"quantity": item.quantity - before.get(str(item.asset_id), 0)})
+                    for item in after_items
+                    if item.quantity > before.get(str(item.asset_id), 0)
+                ]
+                clicks = after_info.total_click_count - before_info.total_click_count
+        summary = "兑换成功。"
+        if clicks:
+            summary += f"\n累计点击变化：{clicks:+,}。"
+        if not gains:
+            return [summary + "\n背包未检测到物品增加。"]
+        summary += "\n背包增加：\n" + "\n".join(
+            f"{self.cards.item_name(item.asset_id, item.asset_name)} ×{item.quantity}" for item in gains
+        )
+        try:
+            images = await self.cards.redeemed(account, gains, event)
+        except Exception:
+            logger.exception("[WuwaTappoUID] 兑换成功，但结果图绘制失败")
+            return [summary + "\n结果图绘制失败，可用 wt背包 查看。"]
+        return [summary, *images]
+
+    async def chest_statistics(self, event: Event, period: StatisticsPeriod) -> list[str | bytes]:
+        async with self.user_lock(identity(event.bot_id, event.user_id)):
+            _, account = await self.bound(event, allow_expired=True)
+            first_at, payloads = await Store.chest_history(account.id, period.since, period.until)
+        stats = await asyncio.to_thread(ChestStatistics.aggregate, payloads)
+        return [await self.cards.chest_statistics(account, event, period, stats, first_at)]
 
     async def synthesize(self, event: Event, same_level: bool = False) -> list[str | bytes]:
         results: list[SynthesisResult] = []
@@ -662,7 +727,7 @@ class Service:
         summary += f"消耗多余物品 {spent} 件，获得 {len(results)} 件。"
         if not results and not problem:
             cost = 5 if same_level else 10
-            return [f"没有足够的多余物品可{mode_name}合成：每种保留 1 件，需同品类同稀有度 {cost} 件。"]
+            return [f"没有足够的多余物品可{mode_name}合成：已跳过收藏，每种保留 1 件，需同品类同稀有度 {cost} 件。"]
         if problem:
             summary += "\n" + problem
         if not results:
