@@ -12,6 +12,18 @@ CHINA = timezone(timedelta(hours=8))
 RARITIES = ("epic", "rare", "uncommon", "common")
 
 
+def read_result(payload: str) -> OpenResult:
+    try:
+        result = OpenResult.model_validate_json(payload)
+    except ValidationError:
+        raise DataError("历史开箱流水的物品详情格式异常，请管理员检查记录。") from None
+    rarity = str(result.rarity_type).strip().lower()
+    if rarity not in RARITIES:
+        raise DataError("历史开箱流水含未识别的稀有度，请管理员检查记录。")
+    result.rarity_type = rarity
+    return result
+
+
 @dataclass(frozen=True)
 class StatisticsPeriod:
     label: str
@@ -52,25 +64,20 @@ class ChestStatistics:
         return self.total - self.missing
 
     @classmethod
-    def aggregate(cls, groups: list[tuple[str, int]]) -> "ChestStatistics":
+    def aggregate(cls, groups: list[tuple[str, int, int | None]]) -> "ChestStatistics":
         counts = dict.fromkeys(RARITIES, 0)
         quantities: Counter[str] = Counter()
         items: dict[str, OpenResult] = {}
         total = missing = clicks = 0
-        for payload, count in groups:
+        for payload, count, consumed in groups:
             total += count
             if not payload:
                 missing += count
                 continue
-            try:
-                result = OpenResult.model_validate_json(payload)
-            except ValidationError:
-                raise DataError("历史开箱流水的物品详情格式异常，请管理员检查记录。") from None
-            rarity = str(result.rarity_type).strip().lower()
-            if rarity not in counts:
-                raise DataError("历史开箱流水含未识别的稀有度，请管理员检查记录。")
+            result = read_result(payload)
+            rarity = str(result.rarity_type)
             counts[rarity] += count
-            clicks += result.click_consume * count
+            clicks += result.click_consume * count if consumed is None else consumed
             key = str(result.asset_id)
             quantities[key] += count
             items[key] = result

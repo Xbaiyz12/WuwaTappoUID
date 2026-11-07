@@ -9,7 +9,7 @@ from gsuid_core.utils.database import base_models
 from gsuid_core.utils.database.base_models import with_read_session, with_session
 from gsuid_core.utils.database.models import CoreUser, Subscribe
 from gsuid_core.utils.database.startup import exec_list
-from sqlalchemy import Column, Connection, Index, Text, func, inspect, text
+from sqlalchemy import Column, Connection, Index, Text, func, inspect, literal, text, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, col, select
 
@@ -77,7 +77,7 @@ class LoginSession(SQLModel, table=True):
     owner_id: str = Field(index=True, max_length=64)
     platform: str = Field(max_length=64)
     user_id: str = Field(max_length=128)
-    subscription_id: int
+    subscription_id: int = Field(index=True)
     expires_at: float
     status: str = Field(default="pending", max_length=16)
     account_id: str = Field(default="", max_length=64)
@@ -99,7 +99,7 @@ class ChestTask(SQLModel, table=True):
     account_id: str = Field(primary_key=True, max_length=64)
     run_id: str = Field(max_length=32)
     owner_id: str = Field(max_length=64)
-    subscription_id: int
+    subscription_id: int = Field(index=True)
     status: str = Field(default="active", max_length=16)
     pause_reason: str = Field(default="", max_length=32)
     started_at: float
@@ -125,12 +125,13 @@ class ChestRecord(SQLModel, table=True):
         Index("ix_wt_chest_record_pending", "state", "notice_id", "account_id"),
         Index("ix_wt_chest_record_recent", "account_id", "run_id", "side", "created_at"),
         Index("ix_wt_chest_record_history", "account_id", "created_at"),
+        Index("ix_wt_chest_record_retention", "created_at"),
         {"extend_existing": True},
     )
     id: str = Field(default_factory=new_id, primary_key=True, max_length=32)
     account_id: str = Field(index=True, max_length=64)
     run_id: str = Field(index=True, max_length=32)
-    subscription_id: int
+    subscription_id: int = Field(index=True)
     side: str = Field(max_length=8)
     created_at: float = Field(default_factory=time.time)
     state: str = Field(default="sending", index=True, max_length=16)
@@ -142,9 +143,9 @@ class ChestRecord(SQLModel, table=True):
 
 class Notice(SQLModel, table=True):
     __tablename__ = "wt_notice"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (Index("ix_wt_notice_retention", "submitted", "submitted_at"), {"extend_existing": True})
     id: str = Field(default_factory=new_id, primary_key=True, max_length=32)
-    subscription_id: int
+    subscription_id: int = Field(index=True)
     account_id: str = Field(index=True, max_length=64)
     created_at: float = Field(default_factory=time.time)
     text: str = Field(sa_column=Column(Text, nullable=False))
@@ -161,7 +162,7 @@ class Notice(SQLModel, table=True):
 
 class SynthesisRecord(SQLModel, table=True):
     __tablename__ = "wt_synthesis_record"
-    __table_args__ = {"extend_existing": True}
+    __table_args__ = (Index("ix_wt_synthesis_record_retention", "state", "created_at"), {"extend_existing": True})
     id: str = Field(default_factory=new_id, primary_key=True, max_length=32)
     run_id: str = Field(index=True, max_length=32)
     account_id: str = Field(index=True, max_length=64)
@@ -173,6 +174,21 @@ class SynthesisRecord(SQLModel, table=True):
     state: str = Field(default="sending", max_length=16)
     result: str = Field(default="", sa_column=Column(Text, nullable=False))
     error: str = Field(default="", max_length=160)
+
+
+class ChestSummary(SQLModel, table=True):
+    """day=0 为累计归档；其余为北京时间零点，仅保留最近30天的按日归档。"""
+
+    __tablename__ = "wt_chest_summary"
+    __table_args__ = (Index("ix_wt_chest_summary_day", "day"), {"extend_existing": True})
+    account_id: str = Field(primary_key=True, max_length=64)
+    day: int = Field(primary_key=True)
+    asset_id: str = Field(primary_key=True, max_length=32)
+    rarity: str = Field(primary_key=True, max_length=32)
+    result: str = Field(default="", sa_column=Column(Text, nullable=False))
+    quantity: int = 0
+    clicks: int = 0
+    first_at: float
 
 
 # 按 GS 官方流程注册补列；旧数据使用默认值，不要求回填历史账号关联。
@@ -218,6 +234,7 @@ PLUGIN_TABLE_NAMES = (
     "wt_login_session",
     "wt_chest_task",
     "wt_chest_record",
+    "wt_chest_summary",
     "wt_notice",
     "wt_synthesis_record",
 )
@@ -248,8 +265,9 @@ def _ensure_schema(connection: Connection) -> list[str]:
     if missing:
         raise DatabaseSchemaError(f"插件数据库缺少字段：{'、'.join(missing)}；后台任务不会启动。")
     # create_all 跳过已有表时也跳过新增索引，升级时单独创建。
-    for index in SQLModel.metadata.tables["wt_chest_record"].indexes:
-        index.create(connection, checkfirst=True)
+    for table in tables:
+        for index in table.indexes:
+            index.create(connection, checkfirst=True)
     return changes
 
 
@@ -349,9 +367,9 @@ class Store:
                 col(ChestTask.expires_at) > func.coalesce(col(ChestTask.paused_at), time.time()),
             )
         )
-        total_chests = await session.scalar(
-            select(func.count()).select_from(ChestRecord).where(col(ChestRecord.state) == "success")
-        )
+        recent = select(func.count()).select_from(ChestRecord).where(col(ChestRecord.state) == "success")
+        archived = select(func.coalesce(func.sum(col(ChestSummary.quantity)), 0)).where(col(ChestSummary.day) == 0)
+        total_chests = await session.scalar(select(recent.scalar_subquery() + archived.scalar_subquery()))
         return bound_people, task_people, total_chests
 
     @classmethod
@@ -453,17 +471,36 @@ class Store:
     @with_read_session
     async def chest_history(
         cls, session: AsyncSession, account_id: str, since: float, until: float
-    ) -> tuple[float | None, list[tuple[str, int]]]:
+    ) -> tuple[float | None, list[tuple[str, int, int | None]]]:
         conditions = (col(ChestRecord.account_id) == account_id, col(ChestRecord.state) == "success")
-        first_at = await session.scalar(select(func.min(col(ChestRecord.created_at))).where(*conditions))
-        result = await session.execute(
-            # 相同物品结果先在数据库计数，避免全部历史逐条加载和解析。
-            select(col(ChestRecord.result), func.count())
+        starts = union_all(
+            select(func.min(col(ChestRecord.created_at)).label("first_at")).where(*conditions),
+            select(func.min(col(ChestSummary.first_at))).where(
+                col(ChestSummary.account_id) == account_id, col(ChestSummary.day) == 0
+            ),
+        ).subquery()
+        first_at = await session.scalar(select(func.min(starts.c.first_at)))
+        recent = (
+            select(
+                col(ChestRecord.result).label("result"), func.count().label("quantity"), literal(None).label("clicks")
+            )
             .where(*conditions, col(ChestRecord.created_at) >= since, col(ChestRecord.created_at) <= until)
             .group_by(col(ChestRecord.result))
-            .order_by(func.min(col(ChestRecord.created_at)), col(ChestRecord.result))
         )
-        return first_at, [(payload, count) for payload, count in result.all()]
+        archive_days = (
+            col(ChestSummary.day) == 0
+            if since == 0
+            else (col(ChestSummary.day) >= since) & (col(ChestSummary.day) <= until)
+        )
+        archived = select(col(ChestSummary.result), col(ChestSummary.quantity), col(ChestSummary.clicks)).where(
+            col(ChestSummary.account_id) == account_id, archive_days
+        )
+        # 同一条SELECT同时读取原始流水和归档，归档事务提交前后都不会漏计或重复计数。
+        history = union_all(recent, archived).subquery()
+        result = await session.execute(
+            select(history.c.result, history.c.quantity, history.c.clicks).order_by(history.c.result)
+        )
+        return first_at, [(payload, count, clicks) for payload, count, clicks in result.all()]
 
     @classmethod
     @with_read_session
@@ -514,7 +551,7 @@ class Store:
                 col(ChestRecord.run_id) == run_id,
                 col(ChestRecord.side) == side,
             )
-            .order_by(col(ChestRecord.created_at).desc())
+            .order_by(col(ChestRecord.created_at).desc(), col(ChestRecord.id).desc())
             .limit(4)
         )
         return list(result.scalars().all())

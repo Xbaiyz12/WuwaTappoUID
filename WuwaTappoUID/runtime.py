@@ -29,6 +29,7 @@ NOTICE_JOB = "WuwaTappoUID:notice"
 RESOURCE_JOB = "WuwaTappoUID:resources"
 LOGIN_JOB = "WuwaTappoUID:login"
 LOCAL_LOGIN_JOB = "WuwaTappoUID:login-local"
+HISTORY_JOB = "WuwaTappoUID:history"
 _initialize_lock = asyncio.Lock()
 _initialize_attempted = False
 
@@ -176,6 +177,16 @@ async def wt_start() -> None:
         id=NOTICE_JOB,
         name="WuwaTappo 待发通知与任务巡检",
         replace_existing=True,
+    )
+    scheduler.add_job(
+        service.archive_history,
+        "interval",
+        seconds=60,
+        id=HISTORY_JOB,
+        name="WuwaTappo 历史归档与清理",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
     scheduler.add_job(
         login.poll_local,

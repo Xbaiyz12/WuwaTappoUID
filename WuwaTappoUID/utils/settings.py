@@ -25,6 +25,14 @@ settings = StringConfig(
             desc="wt宝箱新建任务及每次续期增加的小时数，须为正整数；已有任务到期时间不变。",
             data=24,
         ),
+        "record_retention_days": GsIntConfig(
+            title="原始记录保留天数",
+            desc=(
+                "正整数，默认7天，含今天。过期成功开箱归档后删除明细，已完成通知和合成流水同步清理；"
+                "保留近30天按日统计及长期累计。保存后下一轮生效，已归档明细不会恢复。"
+            ),
+            data=7,
+        ),
         "login_public_url": GsStrConfig(
             title="登录页面地址",
             desc=(
@@ -65,6 +73,10 @@ def max_click_increment() -> int:
 
 def chest_task_hours() -> int:
     return positive_int("chest_task_hours")
+
+
+def record_retention_days() -> int:
+    return positive_int("record_retention_days")
 
 
 def retry_limit() -> int:

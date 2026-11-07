@@ -6,7 +6,7 @@ import json
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gsuid_core.aps import scheduler
 from gsuid_core.gss import gss
@@ -24,6 +24,7 @@ from .cards import Cards, ResultContext
 from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Notice, Store, SynthesisRecord, new_id
 from .failures import Failures
 from .formatting import account_text, date_text, mask_cuid, task_text
+from .history import HistoryArchive
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
@@ -52,8 +53,8 @@ from .schema import (
     WuwaError,
     token_expiry,
 )
-from .settings import bot_name, chest_task_hours, max_click_increment, retry_limit
-from .statistics import ChestStatistics, StatisticsPeriod
+from .settings import bot_name, chest_task_hours, max_click_increment, record_retention_days, retry_limit, settings
+from .statistics import CHINA, ChestStatistics, StatisticsPeriod
 from .synthesis import highest_tiers, next_recipe
 
 NOTICE_CACHE_BYTES = 32 * 1024 * 1024
@@ -85,6 +86,8 @@ class Service:
         self._push_lock = asyncio.Lock()
         self._notice_images: OrderedDict[str, CachedNoticeImage] = OrderedDict()
         self._notice_image_bytes = 0
+        self._archive_days: int | None = None
+        self._archive_next = 0.0
         self.closing = False
         self.database_ready = False
         self.database_error = "插件尚未完成数据库初始化，请稍后重试。"
@@ -1439,6 +1442,46 @@ class Service:
                     task.next_check = time.time()
                     await Store.save(task)
                     self.schedule(task)
+
+    async def archive_history(self) -> None:
+        if self.closing or not self.database_ready:
+            return
+        configured = settings.get_config("record_retention_days").data
+        if configured != self._archive_days:
+            self._archive_days = configured
+            self._archive_next = 0
+            await self.failures.success("history")
+        if time.time() < self._archive_next or not self.failures.allows("history"):
+            return
+        try:
+            days = record_retention_days()
+            midnight = datetime.now(CHINA).replace(hour=0, minute=0, second=0, microsecond=0)
+            cutoff = (midnight - timedelta(days=days - 1)).timestamp()
+            daily_cutoff = (midnight - timedelta(days=29)).timestamp()
+            records = other = 0
+            for _ in range(10):
+                if self.closing or not self.database_ready:
+                    return
+                archived = await HistoryArchive.archive_batch(cutoff, daily_cutoff)
+                cleaned = await HistoryArchive.cleanup_batch(cutoff, daily_cutoff)
+                records += archived
+                other += cleaned
+                if not archived and not cleaned:
+                    break
+                await asyncio.sleep(0.1)
+            # 有积压时下分钟继续，空闲时每小时检查；配置变化在下一次分钟巡检生效。
+            self._archive_next = time.time() + (60 if archived or cleaned else 3600)
+            await self.failures.success("history")
+            if records or other:
+                logger.info(
+                    f"[WuwaTappoUID] 历史归档完成：开箱流水 {records} 条，已完成记录及过期按日汇总 {other} 条。"
+                )
+        except SQLAlchemyError as error:
+            await self.disable_database(error)
+        except Exception as error:
+            if self.failures.attempts("history") == 0:
+                logger.exception("[WuwaTappoUID] 历史归档出现异常")
+            await self.failures.fail("history", "历史归档", self.error_detail(error), delay=300)
 
     @with_read_cache
     async def maintain(self) -> None:
