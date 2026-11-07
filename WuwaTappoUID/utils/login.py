@@ -13,6 +13,8 @@ from gsuid_core.config import core_config
 from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.subscribe import gs_subscribe
+from gsuid_core.utils.database.base_models import DatabaseWriteTimeout
+from gsuid_core.utils.database.write_gate import WriteGateTimeout
 from sqlalchemy.exc import SQLAlchemyError
 
 from . import login_remote
@@ -84,6 +86,7 @@ class LoginManager:
                 old.submission = ""
                 old.external_synced = True
                 old.external_poll_token = ""
+                old.external_result_pending = False
                 self._remote_retries.pop(old.id, None)
             await Store.save(*opened, row)
         url = base + "/wuwatappouid/i/" + state
@@ -106,6 +109,7 @@ class LoginManager:
             row.status = "expired"
             row.message = "登录链接已过期，请重新发送 wt登录。"
             row.submission = ""
+            row.external_result_pending = False
             await Store.save(
                 row, Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message)
             )
@@ -247,6 +251,7 @@ class LoginManager:
                         logger.error(f"[WuwaTappoUID] 登录成功但任务恢复失败：{self.service.error_detail(error)}")
                         note = f"登录成功，但任务尚未恢复：{self.service.error_detail(error)}；可稍后用 wt恢复。"
                     row.status = "success"
+                    row.external_result_pending = bool(row.external_url)
                     row.message = "登录成功，已绑定为当前账号。"
                     if not account.can_recover(row.owner_id):
                         note += "\n本次登录未收到SDK有效期，未启用免验证码恢复；使用外置登录时请更新ww-login。"
@@ -278,16 +283,21 @@ class LoginManager:
                     row.status = "failed"
                 row.message = str(error)
                 row.submission = ""
-                await Store.save(row)
+                row.external_result_pending = bool(row.external_url)
+                await Store.save(row, *self.result_notices(row))
             except SQLAlchemyError as error:
                 await self.service.disable_database(error)
                 raise WuwaError(self.service.database_error) from None
+            except (DatabaseWriteTimeout, WriteGateTimeout):
+                # 提交结果由轮询入口按现有后台失败预算处理，不再尝试第二次故障写入。
+                raise
             except Exception:
                 logger.exception("[WuwaTappoUID] 网页登录处理异常")
                 row.status = "failed"
                 row.submission = ""
                 row.message = "登录处理出现异常，已记录，请重新发送 wt登录。"
-                await Store.save(row)
+                row.external_result_pending = bool(row.external_url)
+                await Store.save(row, *self.result_notices(row))
         return self.response(row)
 
     def wake_notices(self) -> None:
@@ -295,14 +305,12 @@ class LoginManager:
         if job is not None:
             job.modify(next_run_time=datetime.now(timezone.utc))
 
-    async def notify_result(self, row: LoginSession) -> None:
+    @staticmethod
+    def result_notices(row: LoginSession) -> list[Notice]:
         if row.status not in ("failed", "verifying"):
-            return  # 成功和到期通知已与状态一起保存。
+            return []  # 成功和到期通知已与状态一起保存。
         note = "\n请重新打开原登录链接，点击继续登录。" if row.status == "verifying" else "\n请重新发送 wt登录。"
-        await Store.save(
-            Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message + note)
-        )
-        self.wake_notices()
+        return [Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message + note)]
 
     async def poll_local(self) -> None:
         if not self.service.database_ready or self.service.closing:
@@ -314,21 +322,26 @@ class LoginManager:
             await self.service.disable_database(error)
 
     async def poll_local_one(self, snapshot: LoginSession) -> None:
-        if self.service.user_lock(snapshot.owner_id).locked():
+        failure_key = "login-local:" + snapshot.id
+        if not self.service.failures.allows(failure_key) or self.service.user_lock(snapshot.owner_id).locked():
             return
         try:
             await self.complete_key(snapshot.id, None)
-            row = await Store.login_session(snapshot.id)
-            if row.status not in ("pending", "verifying") and row.submission:
-                row.submission = ""
-                await Store.save(row)
-            await self.notify_result(row)
+            await self.service.failures.success(failure_key)
+            self.wake_notices()
         except SQLAlchemyError:
             raise
-        except WuwaError as error:
-            logger.warning(f"[WuwaTappoUID] 本地登录处理未完成：{self.service.error_detail(error)}")
-        except Exception:
-            logger.exception("[WuwaTappoUID] 本地登录会话处理异常")
+        except Exception as error:
+            write_timeout = isinstance(error, (DatabaseWriteTimeout, WriteGateTimeout))
+            if (
+                not write_timeout
+                and not isinstance(error, WuwaError)
+                and self.service.failures.attempts(failure_key) == 0
+            ):
+                logger.exception("[WuwaTappoUID] 本地登录会话处理异常")
+            phase = "本地登录写入超时" if write_timeout else "本地登录会话处理"
+            detail = f"{snapshot.platform} 用户 {mask_cuid(snapshot.user_id)}：{self.service.error_detail(error)}"
+            await self.service.failures.fail(failure_key, phase, detail, snapshot.account_id)
 
     async def poll_external(self) -> None:
         if not self.service.database_ready or self.service.closing:
@@ -352,27 +365,29 @@ class LoginManager:
                 # 链接过期停止通信；已经成功的绑定和保存的 token 保留。
                 row.external_synced = True
                 row.external_poll_token = ""
+                row.external_result_pending = False
                 await Store.save(row)
                 self._remote_retries.pop(row.id, None)
                 return
             if row.status == "processing":
                 return
-            if row.status in ("pending", "verifying"):
+            if row.status in ("pending", "verifying") and not row.external_result_pending:
                 data = await login_remote.poll(self.service.api, row)
                 if not data.submitted:
                     self._remote_retries.pop(row.id, None)
                     return
                 result = await self.complete_key(row.id, data.login)
                 row = await Store.login_session(row.id)
-                await self.notify_result(row)
+                self.wake_notices()
             else:
                 result = self.response(row)
             await login_remote.confirm(self.service.api, row, result)
+            row.external_result_pending = False
             # verifying 会话等待用户在页面点击继续，只验证已保存的 token。
             if row.status not in ("pending", "verifying"):
                 row.external_synced = True
                 row.external_poll_token = ""
-                await Store.save(row)
+            await Store.save(row)
             self._remote_retries.pop(row.id, None)
         except SQLAlchemyError:
             raise
@@ -382,6 +397,7 @@ class LoginManager:
                 # 正常到期不触发后台故障告警，也不撤销已完成的账号绑定。
                 row.external_synced = True
                 row.external_poll_token = ""
+                row.external_result_pending = False
                 await Store.save(row)
                 self._remote_retries.pop(row.id, None)
                 return

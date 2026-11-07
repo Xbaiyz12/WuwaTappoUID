@@ -90,6 +90,7 @@ class LoginSession(SQLModel, table=True):
     external_state: str = Field(default="", max_length=128, repr=False)
     external_poll_token: str = Field(default="", max_length=128, repr=False)
     external_synced: bool = False
+    external_result_pending: bool = False
 
 
 class ChestTask(SQLModel, table=True):
@@ -181,6 +182,7 @@ ADDED_COLUMNS = {
         "external_state": "VARCHAR(128) NOT NULL DEFAULT ''",
         "external_poll_token": "VARCHAR(128) NOT NULL DEFAULT ''",
         "external_synced": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "external_result_pending": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
     "wt_account": {
         "sdk_token": "TEXT NOT NULL DEFAULT ''",
@@ -307,6 +309,7 @@ class Store:
             elif row.expires_at <= now and row.status in ("pending", "verifying"):
                 row.status = "expired"
                 row.submission = ""
+                row.external_result_pending = False
                 row.message = "登录链接已过期，请重新发送 wt登录。"
                 session.add(row)
                 session.add(Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message))
