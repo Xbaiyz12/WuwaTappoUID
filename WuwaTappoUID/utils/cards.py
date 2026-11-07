@@ -49,6 +49,7 @@ class BundledCatalog(BaseModel):
 class ResultContext:
     header: Header
     progress: list[Progress] | None
+    owned: set[str] | None = None
 
 
 class Cards:
@@ -275,14 +276,17 @@ class Cards:
 
     async def result_context(self, account: Account, event: Event) -> ResultContext:
         progress = None
+        owned = None
         if account.token_state == "expired":
             return ResultContext(await self.header(account, None, event), progress)
         try:
             async with asyncio.timeout(12):
-                progress = self.progress(await self.api.bags(account.token))
+                items = await self.api.bags(account.token)
+                progress = self.progress(items)
+                owned = {str(item.asset_id) for item in items if item.quantity > 0}
         except (WuwaError, TimeoutError) as error:
             logger.warning(f"[WuwaTappoUID] 本次汇总图无法刷新收集进度：{type(error).__name__}")
-        return ResultContext(await self.header(account, None, event), progress)
+        return ResultContext(await self.header(account, None, event), progress, owned)
 
     async def results(
         self, records: list[ChestRecord], available: int | None, note: str, context: ResultContext
@@ -312,6 +316,8 @@ class Cards:
             next(loaded) if record.result else Card(name="物品信息未收到", rarity="common", kind="未知")
             for record in records
         ]
+        for card, record in zip(cards, records, strict=True):
+            card.fresh = record.fresh and bool(record.result)
         header = replace(context.header, available=available)
         return await self.draw(header, "开箱结果", cards, note, context.progress)
 

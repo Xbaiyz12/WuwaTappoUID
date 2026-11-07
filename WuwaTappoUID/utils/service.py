@@ -253,6 +253,7 @@ class Service:
             account.sdk_expires_at = saved.sdk_expires_at
             account.sdk_owner_id = saved.sdk_owner_id
             account.info = saved.info
+            account.bag_snapshot = saved.bag_snapshot
             account.verified_at = saved.verified_at
         if account.token_state == "expired":
             raise AuthenticationError(TOKEN_EXPIRED_MESSAGE)
@@ -1603,8 +1604,6 @@ class Service:
             if rendered is None:
                 revision = self.resources.revision
                 name = bot_name()
-                if account.id not in contexts:
-                    contexts[account.id] = await self.cards.result_context(account, event)
                 records = await Store.records(json.loads(notice.record_ids))
                 rendered = await self.cards.results(records, notice.available_clicks, notice_text, contexts[account.id])
                 self.cache_notice_image(notice.id, revision, name, rendered)
@@ -1675,6 +1674,25 @@ class Service:
                             key = notice.account_id
                             if key not in accounts:
                                 accounts[key] = await Store.account(key)
+                            if (
+                                notice.record_ids
+                                and key not in contexts
+                                and self.cached_notice_image(notice.id) is None
+                            ):
+                                account = accounts[key]
+                                if account is None:
+                                    raise DataError("开箱通知对应的账号不存在。")
+                                contexts[key] = await self.cards.result_context(account, event)
+                                unchecked = [
+                                    n for n in batch if n.account_id == key and n.record_ids and not n.new_checked
+                                ]
+                                if unchecked:
+                                    async with self.account_lock(key):
+                                        await Store.prepare_new_items(
+                                            key, [n.id for n in unchecked], contexts[key].owned
+                                        )
+                                    for row in unchecked:
+                                        row.new_checked = True
                             contents.extend(await self.notice_messages(notice, event, accounts[key], contexts))
                         await self.failures.success(render_key)
                     except SQLAlchemyError:

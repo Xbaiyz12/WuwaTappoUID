@@ -1,5 +1,6 @@
 """插件专属表和 GS 数据库会话封装。"""
 
+import json
 import time
 from uuid import uuid4
 
@@ -13,7 +14,7 @@ from sqlalchemy import Column, Connection, Index, Text, func, inspect, literal, 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, col, select
 
-from .schema import DatabaseSchemaError
+from .schema import DatabaseSchemaError, DataError, OpenResult
 
 
 def new_id() -> str:
@@ -38,6 +39,7 @@ class Account(SQLModel, table=True):
     sdk_expires_at: float = 0
     sdk_owner_id: str = Field(default="", max_length=64)
     subscribed: bool = False
+    bag_snapshot: str = Field(default="", sa_column=Column(Text, nullable=False), repr=False)
 
     def clear_sdk(self) -> None:
         self.sdk_token = self.sdk_openid = self.sdk_username = self.sdk_owner_id = ""
@@ -137,6 +139,7 @@ class ChestRecord(SQLModel, table=True):
     state: str = Field(default="sending", index=True, max_length=16)
     before_info: str = Field(sa_column=Column(Text, nullable=False))
     result: str = Field(default="", sa_column=Column(Text, nullable=False))
+    fresh: bool = False
     supplement: str = Field(default="", sa_column=Column(Text, nullable=False))
     notice_id: str = Field(default="", max_length=32)
 
@@ -154,6 +157,7 @@ class Notice(SQLModel, table=True):
     rarity: str = Field(default="", max_length=32)
     submitted: bool = Field(default=False, index=True)
     submitted_at: float | None = None
+    new_checked: bool = False
     attempts: int = 0
     last_error: str = Field(default="", max_length=160)
     record_ids: str = Field(default="", sa_column=Column(Text, nullable=False))
@@ -211,15 +215,20 @@ ADDED_COLUMNS = {
         "token_expires_at": "FLOAT NOT NULL DEFAULT 0",
         "token_renew_after": "FLOAT NOT NULL DEFAULT 0",
         "token_state": "VARCHAR(32) NOT NULL DEFAULT 'ready'",
+        "bag_snapshot": "TEXT NOT NULL DEFAULT ''",
     },
     "wt_chest_task": {"paused_at": "FLOAT DEFAULT NULL"},
     # 已有记录不重新推送；新记录由模型显式写入空 notice_id。
-    "wt_chest_record": {"notice_id": "VARCHAR(32) NOT NULL DEFAULT 'legacy'"},
+    "wt_chest_record": {
+        "notice_id": "VARCHAR(32) NOT NULL DEFAULT 'legacy'",
+        "fresh": "BOOLEAN NOT NULL DEFAULT FALSE",
+    },
     "wt_notice": {
         "asset_id": "VARCHAR(32) NOT NULL DEFAULT ''",
         "rarity": "VARCHAR(32) NOT NULL DEFAULT ''",
         "record_ids": "TEXT NOT NULL DEFAULT ''",
         "available_clicks": "BIGINT DEFAULT NULL",
+        "new_checked": "BOOLEAN NOT NULL DEFAULT FALSE",
     },
 }
 exec_list.extend(
@@ -466,6 +475,42 @@ class Store:
         result = await session.execute(select(ChestRecord).where(col(ChestRecord.id).in_(ids)))
         rows = {row.id: row for row in result.scalars().all()}
         return [rows[key] for key in ids]
+
+    @classmethod
+    @with_session
+    async def prepare_new_items(
+        cls, session: AsyncSession, account_id: str, notice_ids: list[str], owned: set[str] | None
+    ) -> None:
+        account = await session.get(Account, account_id)
+        if account is None:
+            raise DataError("开箱通知对应的账号不存在。")
+        result = await session.execute(
+            select(Notice).where(
+                Notice.account_id == account_id, col(Notice.id).in_(notice_ids), col(Notice.new_checked).is_(False)
+            )
+        )
+        notices = list(result.scalars().all())
+        if not notices:
+            return
+        ids = {key for notice in notices for key in json.loads(notice.record_ids)}
+        result = await session.execute(
+            select(ChestRecord)
+            .where(ChestRecord.account_id == account_id, col(ChestRecord.id).in_(ids))
+            .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
+        )
+        # 首次通知仅建立基线；积压的多组结果一起比较，避免更新快照后漏掉后续组的NEW。
+        new_ids = owned - set(json.loads(account.bag_snapshot)) if owned is not None and account.bag_snapshot else set()
+        for record in result.scalars().all():
+            asset_id = str(OpenResult.model_validate_json(record.result).asset_id) if record.result else ""
+            record.fresh = asset_id in new_ids
+            new_ids.discard(asset_id)
+            session.add(record)
+        if owned is not None:
+            account.bag_snapshot = json.dumps(sorted(owned), separators=(",", ":"))
+            session.add(account)
+        for notice in notices:
+            notice.new_checked = True
+            session.add(notice)
 
     @classmethod
     @with_read_session
