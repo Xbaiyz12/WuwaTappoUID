@@ -8,6 +8,7 @@ from gsuid_core.data_store import get_res_path
 from gsuid_core.gss import gss
 from gsuid_core.logger import logger
 from gsuid_core.server import on_core_shutdown, on_core_start, on_core_start_before
+from gsuid_core.shutdown import shutdown_event
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -227,6 +228,10 @@ async def wt_bot_connected() -> None:
 
 @on_core_shutdown(priority=-10)
 async def wt_shutdown() -> None:
+    # GS重启前也会执行退出钩子；只有实际退出时才设置该事件。
+    if not shutdown_event.is_set():
+        logger.debug("[WuwaTappoUID] 核心尚未实际退出，保留网络会话与后台任务。")
+        return
     service.closing = True
     for job in scheduler.get_jobs():
         if job.id.startswith("WuwaTappoUID:"):
