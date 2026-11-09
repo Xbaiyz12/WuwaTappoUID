@@ -470,7 +470,13 @@ class Cards:
         return await self.draw_atlas(header, f"图鉴 · {KINDS[kind]}", groups, progress)
 
     async def synthesis(
-        self, account: Account, results: list[SynthesisResult], items: list[Item] | None, event: Event, note: str
+        self,
+        account: Account,
+        results: list[SynthesisResult],
+        items: list[Item] | None,
+        event: Event,
+        note: str,
+        owned_before: set[str],
     ) -> list[bytes]:
         info = UserInfo.model_validate_json(account.info)
         header = await self.header(account, info.remaining, event)
@@ -480,6 +486,11 @@ class Cards:
                 for r in results
             ]
         )
+        seen = set(owned_before)
+        for card, result in zip(cards, results, strict=True):
+            key = str(result.asset_id)
+            card.fresh = key not in seen
+            seen.add(key)
         pages = (len(cards) + 39) // 40
         progress = self.progress(items) if items is not None else None
         return [

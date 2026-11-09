@@ -660,6 +660,7 @@ class Service:
             async with self.account_lock(account.id):
                 await self.refresh(account)
                 items = await self.read_bag(account)
+                owned_before = {str(item.asset_id) for item in items if item.quantity > 0}
                 highest = {} if same_level else highest_tiers(await self.api.atlas())
                 while True:
                     try:
@@ -738,7 +739,12 @@ class Service:
             return [summary]
         try:
             images = await self.cards.synthesis(
-                account, results, items if bag_current else None, event, f"升阶 {upgrades} 次 · 同阶 {same_count} 次"
+                account,
+                results,
+                items if bag_current else None,
+                event,
+                f"升阶 {upgrades} 次 · 同阶 {same_count} 次",
+                owned_before,
             )
         except Exception:
             logger.exception("[WuwaTappoUID] 合成结果已保存，但结果图绘制失败")

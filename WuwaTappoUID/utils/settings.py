@@ -46,6 +46,11 @@ settings = StringConfig(
             desc="默认开启，使用 GsCore 的登录页；关闭后通过 ww-login 创建会话并主动轮询，无需公网开放 GsCore。",
             data=True,
         ),
+        "login_send_qrcode": GsBoolConfig(
+            title="发送登录二维码图片",
+            desc="默认关闭，发送文字登录链接；开启后发送二维码图片，使用浏览器扫描。本地和外置登录均生效。",
+            data=False,
+        ),
         "retry_limit": GsIntConfig(
             title="后台连续异常阈值",
             desc="持续后台异常达到此次数后提醒主人并暂停异常处理；不封禁用户或账号命令。",

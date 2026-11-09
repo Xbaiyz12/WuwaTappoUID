@@ -90,12 +90,15 @@ class LoginManager:
                 self._remote_retries.pop(old.id, None)
             await Store.save(*opened, row)
         url = base + "/wuwatappouid/i/" + state
+        text = "请在5分钟内打开链接登录本人国服账号，请勿转发。\n" + url
+        if not settings.get_config("login_send_qrcode").data:
+            return [text]
         try:
             card = await render_in_thread(render_login, url)
         except Exception:
             logger.exception("[WuwaTappoUID] 登录二维码绘制失败，发送文字链接")
-            return ["请在5分钟内打开链接登录本人国服账号，请勿转发。\n" + url]
-        return [card, url]
+            return [text]
+        return [card]
 
     async def get(self, state: str) -> LoginSession:
         return await self.get_key(session_key(state))
