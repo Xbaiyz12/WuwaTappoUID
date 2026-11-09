@@ -5,16 +5,17 @@ from html import escape
 from pathlib import Path
 
 from fastapi import Request
-from gsuid_core.web_app import app
+from gsuid_core.webconsole.app_app import app
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse
 
-from ..runtime import login, service
+from ..runtime import login, owner, service
 from ..utils.login_config import SDK_CONFIG
 from ..utils.schema import SdkLogin, WuwaError
 
 ASSETS = Path(__file__).parent.parent / "assets"
+LOGIN_TEMPLATE = (ASSETS / "login" / "login.html").read_text(encoding="utf-8")
 PAGE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
 
 
@@ -29,7 +30,7 @@ def render_page(auth: str, result: dict) -> HTMLResponse:
         f"绑定至：{target}。请确认是本人账号，请勿使用他人的链接。" if target else "请重新发送 wt登录 获取有效链接。"
     )
     initial = json.dumps({"auth": auth, "sdk_config": SDK_CONFIG, **result}, ensure_ascii=False).replace("<", "\\u003c")
-    page = (ASSETS / "login" / "login.html").read_text(encoding="utf-8")
+    page = LOGIN_TEMPLATE
     page = page.replace("__WT_BINDING_TARGET__", escape(binding)).replace("__WT_BOOTSTRAP__", initial)
     return HTMLResponse(page, headers=PAGE_HEADERS)
 
@@ -37,7 +38,7 @@ def render_page(auth: str, result: dict) -> HTMLResponse:
 @app.get("/wuwatappouid/i/{auth}", include_in_schema=False)
 async def wuwatappouid_login_page(auth: str):
     try:
-        result = await login.page_state(auth)
+        result = await owner.run(login.page_state, auth)
     except WuwaError as error:
         result = {"status": 1, "msg": str(error), "data": {}}
     except SQLAlchemyError as error:
@@ -70,7 +71,7 @@ async def wuwatappouid_login_submit(request: Request):
             headers=PAGE_HEADERS,
         )
     try:
-        result = await login.submit(payload.auth, payload.login)
+        result = await owner.run(login.submit, payload.auth, payload.login)
     except WuwaError as error:
         result = {"success": False, "msg": str(error)}
     except SQLAlchemyError as error:

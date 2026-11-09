@@ -37,7 +37,7 @@ PALE_GREEN = (231, 239, 216)
 LINE = (235, 214, 185)
 CREAM = (255, 250, 239)
 CHINA = timezone(timedelta(hours=8))
-PAUSE_LABELS = {"manual": "手动暂停", "auth": "登录态失效", "failure": "连续失败"}
+PAUSE_LABELS = {"manual": "手动暂停", "auth": "登录态失效", "failure": "连续失败", "route": "通知路由失效"}
 
 
 @dataclass

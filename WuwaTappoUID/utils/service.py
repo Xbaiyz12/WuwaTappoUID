@@ -5,8 +5,11 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 from gsuid_core.aps import scheduler
 from gsuid_core.gss import gss
@@ -25,6 +28,8 @@ from .database import Account, AccountLink, Binding, ChestRecord, ChestTask, Not
 from .failures import Failures
 from .formatting import account_text, date_text, mask_cuid, task_text
 from .history import HistoryArchive
+from .lifecycle import tracked_method
+from .render_common import Progress
 from .resources import Resources
 from .schema import (
     AUTO_CLICKS,
@@ -46,6 +51,7 @@ from .schema import (
     Item,
     MaintenanceError,
     NetworkError,
+    OperationStopped,
     SdkLogin,
     Side,
     SynthesisResult,
@@ -59,12 +65,21 @@ from .synthesis import highest_tiers, next_recipe
 
 NOTICE_CACHE_BYTES = 32 * 1024 * 1024
 
+if TYPE_CHECKING:
+    from .lifecycle import RuntimeOwner
+
 
 @dataclass
 class CachedNoticeImage:
     revision: int
     bot_name: str
     body: tuple[bytes, ...]
+
+
+@dataclass
+class NoticeSendGate:
+    lock: asyncio.Lock
+    users: int = 0
 
 
 def identity(platform: str, user_id: str) -> str:
@@ -76,6 +91,8 @@ def account_id(cuid: str, domestic: int) -> str:
 
 
 class Service:
+    runtime: "RuntimeOwner"
+
     def __init__(self, api: WuwaAPI, resources: Resources) -> None:
         self.api = api
         self.resources = resources
@@ -84,6 +101,9 @@ class Service:
         self._accounts: dict[str, asyncio.Lock] = {}
         self._users: dict[str, asyncio.Lock] = {}
         self._push_lock = asyncio.Lock()
+        self.subscription_lock = asyncio.Lock()
+        self._notice_again = False
+        self._notice_sends: dict[int, NoticeSendGate] = {}
         self._notice_images: OrderedDict[str, CachedNoticeImage] = OrderedDict()
         self._notice_image_bytes = 0
         self._archive_days: int | None = None
@@ -96,15 +116,68 @@ class Service:
         if not self.database_ready:
             raise WuwaError(self.database_error)
 
+    def wake_notices(self, delay: float = 0) -> None:
+        if self.closing or not self.runtime.active:
+            return
+        if self._push_lock.locked():
+            self._notice_again = True
+            return
+        job = scheduler.get_job("WuwaTappoUID:notice")
+        if job is not None:
+            job.modify(next_run_time=datetime.fromtimestamp(time.time() + delay, timezone.utc))
+
+    @asynccontextmanager
+    async def subscription(self, event: Event, name: str, uid: str) -> AsyncIterator[int]:
+        if not event.WS_BOT_ID:
+            raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存自动推送目标。")
+        async with self.subscription_lock:
+            await gs_subscribe.add_subscribe("single", name, event, uid=uid)
+            subscriptions = await gs_subscribe.get_subscribe(name, uid=uid)
+            try:
+                if len(subscriptions) != 1:
+                    raise DataError("推送订阅未能唯一保存，未启动操作。")
+                yield subscriptions[0].id
+            except (Exception, asyncio.CancelledError):
+                # 保存失败时回收孤立路由；保存成功的路由仍有表引用。
+                try:
+                    await Store.cleanup_subscriptions([sub.id for sub in subscriptions])
+                except (SQLAlchemyError, DatabaseWriteTimeout, WriteGateTimeout):
+                    logger.error("[WuwaTappoUID] 新建订阅回收失败，后台将重新检查孤立路由。")
+                raise
+
+    async def cleanup_subscriptions(self) -> None:
+        async with self.subscription_lock:
+            await Store.cleanup_subscriptions()
+
+    async def pause_invalid_route(self, task: ChestTask) -> bool:
+        sub = await Store.subscription(task.subscription_id)
+        if sub is not None and sub.WS_BOT_ID:
+            return False
+        if task.status == "active":
+            task.status = "paused"
+            task.pause_reason = "route"
+            task.paused_at = None
+            await Store.save(task)
+            self.schedule(task)
+        await self.failures.fail(
+            f"route:{task.subscription_id}",
+            "通知路由失效",
+            "自动开箱已暂停，请由原用户发送 wt恢复 重建路由。",
+            task.account_id,
+            limit=1,
+        )
+        return True
+
     async def disable_database(self, error: SQLAlchemyError | DatabaseSchemaError) -> None:
         message = "插件数据库初始化或操作失败，后台任务已停止；请更新插件并重启 GsCore。"
         if self.database_error == message:
             return
         self.database_ready = False
         self.database_error = message
-        for job in scheduler.get_jobs():
-            if job.id.startswith("WuwaTappoUID:chest:") or job.id == "WuwaTappoUID:notice":
-                job.remove()
+        if self.runtime.active:
+            for job in scheduler.get_jobs():
+                if job.id.startswith("WuwaTappoUID:chest:") or job.id == "WuwaTappoUID:notice":
+                    job.remove()
         # 不输出 ORM SQL 或绑定参数，其中可能含 token。
         detail = (
             str(error.orig)
@@ -131,7 +204,6 @@ class Service:
             task.account_id,
             limit=1 if already_paused else None,
         )
-        task.failures = failure.attempts
         if failure.blocked:
             if already_paused:
                 # 开箱重试耗尽的通知已由 open_side 保存，只补主人告警。
@@ -219,6 +291,8 @@ class Service:
             self.schedule(task)
         elif not was_expired:
             await Store.save(account)
+
+        self.api.retire_token(account.token)
 
     async def account_notice(self, account: Account, text: str) -> None:
         task = await Store.task(account.id)
@@ -335,10 +409,8 @@ class Service:
         task.paused_at = None
         task.status = "active"
         task.pause_reason = ""
-        task.failures = 0
         task.next_check = self.next_wakeup(task, info)
         await self.failures.reset_account(account.id)
-        await Store.reset_notice_attempts(account.id)
         await Store.save(
             task,
             Notice(
@@ -373,6 +445,7 @@ class Service:
                 if account.sdk_owner_id == owner:
                     account.clear_sdk()
                 # refresh 会优先使用数据库里的旧 token；新会话验证后直接保存。
+                previous_token = account.token
                 account.token = token
                 account.token_state = "ready"
                 account.token_expires_at = 0
@@ -384,6 +457,8 @@ class Service:
                     Binding(id=owner, platform=event.bot_id, user_id=event.user_id, account_id=target),
                     AccountLink(owner_id=owner, account_id=target),
                 )
+                if previous_token and previous_token != token:
+                    self.api.retire_token(previous_token)
                 await self.failures.success("renew:" + account.id)
                 try:
                     resume_note = await self.resume_after_token(account, info)
@@ -394,7 +469,7 @@ class Service:
                     logger.error(f"[WuwaTappoUID] token更新成功但任务恢复失败：{detail}")
                     resume_note = f"登录成功，但任务尚未恢复：{detail}；可稍后用 wt恢复。"
                 task = await Store.task(account.id)
-        await self.flush_notices()
+        self.wake_notices()
         reply = await self.account_reply(account, task, event)
         notice = "token 登录成功，已绑定为当前账号。\n" + resume_note
         return [notice, *reply]
@@ -449,13 +524,16 @@ class Service:
                 remaining = [a for a in accounts if a.id != target.id]
                 replacement = remaining[0].id if remaining else None
                 await Store.delete_link(owner, target.id, replacement)
+                updated = await Store.account(target.id)
+                if target.token and (updated is None or not updated.token):
+                    self.api.retire_token(target.token)
                 if binding.account_id == target.id:
                     current = (
                         f"当前账号已切换为 CUID {mask_cuid(remaining[0].cuid)}。" if remaining else "暂无绑定账号。"
                     )
                 else:
                     current = ""
-        await self.flush_notices()
+        self.wake_notices()
         return (
             f"已删除 CUID {mask_cuid(target.cuid)}（{'国服' if target.domestic else '海外'}）的绑定。"
             + ("本人开启的任务已停止并汇总。" if stopped else "")
@@ -507,7 +585,7 @@ class Service:
                 await Store.save(account)
                 if enabled:
                     await self.queue_results(account.id)
-        await self.flush_notices()
+        self.wake_notices()
         return f"CUID {mask_cuid(account.cuid)}：" + (
             "已开启10次后通知；失败、重新登录、暂停或任务结束时也会补发已有结果。"
             if enabled
@@ -547,7 +625,7 @@ class Service:
             async with self.account_lock(account.id):
                 await self.refresh(account, fresh=True)
                 task = await Store.task(account.id)
-        await self.flush_notices()
+        self.wake_notices()
         reply = await self.account_reply(account, task, event)
         return reply
 
@@ -564,7 +642,7 @@ class Service:
         else:
             image = await self.cards.click_summary(account, event)
             answer = [image]
-        await self.flush_notices()
+        self.wake_notices()
         return answer
 
     async def atlas(self, event: Event, kind: str | None = None) -> list[str | bytes]:
@@ -575,7 +653,7 @@ class Service:
                 await self.refresh(account)
                 items = await self.read_bag(account)
         images: list[str | bytes] = list(await self.cards.atlas(account, items, event, kind))
-        await self.flush_notices()
+        self.wake_notices()
         return images
 
     async def read_bag(self, account: Account, *, fresh: bool = False) -> list[Item]:
@@ -662,7 +740,7 @@ class Service:
                 items = await self.read_bag(account)
                 owned_before = {str(item.asset_id) for item in items if item.quantity > 0}
                 highest = {} if same_level else highest_tiers(await self.api.atlas())
-                while True:
+                while not self.closing:
                     try:
                         recipe = next_recipe(items, highest, same_level=same_level)
                     except WuwaError as error:
@@ -672,6 +750,9 @@ class Service:
                         break
                     if results:
                         await asyncio.sleep(1)
+                    if self.closing:
+                        problem = "插件正在重新加载，本轮已停止，已确认结果保留。"
+                        break
                     record = SynthesisRecord(
                         run_id=run_id,
                         account_id=account.id,
@@ -682,6 +763,11 @@ class Service:
                     await Store.save(record)
                     try:
                         result = await self.api.synthesize(account.token, recipe.asset_ids, recipe.same_level)
+                    except OperationStopped as error:
+                        record.state, record.error = "rejected", str(error)
+                        await Store.save(record)
+                        problem = str(error)
+                        break
                     except MaintenanceError as error:
                         record.state, record.error = "rejected", str(error)
                         await Store.save(record)
@@ -727,7 +813,7 @@ class Service:
                     if record.before_quantity - record.after_quantity != len(recipe.asset_ids) - 1:
                         problem = "服务端背包数量尚未与合成消耗一致，本轮已停止；请用 wt背包 核对。"
                         break
-        await self.flush_notices()
+        self.wake_notices()
         summary = f"本轮已确认：升阶 {upgrades} 次，同阶 {same_count} 次。"
         summary += f"消耗多余物品 {spent} 件，获得 {len(results)} 件。"
         if not results and not problem:
@@ -761,6 +847,8 @@ class Service:
     ) -> tuple[UserInfo, int, str]:
         before = await self.refresh(account)
         self.check_deadline(task)
+        if self.closing:
+            return before, 0, "插件正在重新加载，本次未提交点击。"
         problem = ""
         submission_error = None
         try:
@@ -769,6 +857,8 @@ class Service:
             )
             if ack not in CODE_OK:
                 problem = str(ApiError(ack))
+        except OperationStopped as error:
+            return before, 0, str(error)
         except ApiError as error:
             problem = str(error)
         except (NetworkError, DataError) as error:
@@ -789,7 +879,7 @@ class Service:
             _, account = await self.bound(event)
             async with self.account_lock(account.id):
                 _, delta, problem = await self.add_clicks(account, number)
-        await self.flush_notices()
+        self.wake_notices()
         image = await self.cards.click_summary(account, event, number, delta)
         hint = f"提交提示：{problem}（已回读实际累计值）" if problem else ""
         return [hint, image] if hint else [image]
@@ -798,6 +888,8 @@ class Service:
         return "WuwaTappoUID:chest:" + key
 
     def schedule(self, task: ChestTask) -> None:
+        if not self.runtime.active:
+            return
         if task.timer_paused:
             self.unschedule(task.account_id)
             return
@@ -811,7 +903,7 @@ class Service:
             self.tick,
             "date",
             run_date=datetime.fromtimestamp(
-                max(time.time() + 0.1, task.expires_at if task.pause_reason == "auth" else task.next_check),
+                max(time.time() + 0.1, task.expires_at if task.pause_reason in ("auth", "route") else task.next_check),
                 timezone.utc,
             ),
             args=[task.account_id],
@@ -825,6 +917,8 @@ class Service:
         )
 
     def unschedule(self, key: str) -> None:
+        if self.closing or not self.runtime.active:
+            return
         job = scheduler.get_job(self.job_id(key))
         if job is not None:
             job.remove()
@@ -885,25 +979,22 @@ class Service:
                     if not event.WS_BOT_ID:
                         raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存自动推送目标。")
                     run_id = new_id()
-                    await gs_subscribe.add_subscribe("single", "WuwaTappo宝箱", event, uid=run_id)
-                    subscriptions = await gs_subscribe.get_subscribe("WuwaTappo宝箱", uid=run_id)
-                    if not subscriptions or len(subscriptions) != 1:
-                        raise WuwaError("推送订阅未能唯一保存，未启动开箱。")
-                    now = time.time()
-                    task = ChestTask(
-                        account_id=account.id,
-                        run_id=run_id,
-                        owner_id=binding.id,
-                        subscription_id=subscriptions[0].id,
-                        started_at=now,
-                        expires_at=now + hours * 3600,
-                        next_check=now,
-                    )
-                    await Store.save(task)
+                    async with self.subscription(event, "WuwaTappo宝箱", run_id) as subscription_id:
+                        now = time.time()
+                        task = ChestTask(
+                            account_id=account.id,
+                            run_id=run_id,
+                            owner_id=binding.id,
+                            subscription_id=subscription_id,
+                            started_at=now,
+                            expires_at=now + hours * 3600,
+                            next_check=now,
+                        )
+                        await Store.save(task)
                     self.schedule(task)
                     action = f"已开启 {hours} 小时自动开箱，将立即检查左右宝箱。"
                 answer = action
-        await self.flush_notices()
+        self.wake_notices()
         image = await self.cards.task_summary(account, task, event)
         return [answer, image]
 
@@ -966,22 +1057,19 @@ class Service:
             binding, account = await self.bound(event, allow_expired=True)
             async with self.account_lock(account.id):
                 answer = await self.stop_owned(binding, "已手动停止自动开箱")
-        await self.flush_notices()
+        self.wake_notices()
         return answer
 
-    async def set_paused(self, event: Event, paused: bool) -> str:
-        if not paused:
-            return await self.recover(event)
+    async def pause(self, event: Event) -> str:
         async with self.user_lock(identity(event.bot_id, event.user_id)):
-            binding, account = await self.bound(event, allow_expired=paused)
+            binding, account = await self.bound(event, allow_expired=True)
             async with self.account_lock(account.id):
                 account = await Store.account(binding.account_id)
                 if account is None:
                     raise WuwaError("绑定的账号数据缺失，请重新绑定。")
                 task = await Store.task(account.id)
                 if task is None or task.status not in ("active", "paused"):
-                    action = "暂停" if paused else "恢复"
-                    raise WuwaError(f"当前没有可{action}的任务；请用 wt宝箱 开启新任务。")
+                    raise WuwaError("当前没有可暂停的任务；请用 wt宝箱 开启新任务。")
                 if task.owner_id != binding.id:
                     raise WuwaError("任务属于另一用户，请由任务所属用户操作。")
                 if task.remaining() <= 0:
@@ -1006,7 +1094,7 @@ class Service:
                     self.unschedule(account.id)
                     await self.queue_results(account.id, force=True, reason="任务暂停")
                     answer = action + "\n" + task_text(task)
-        await self.flush_notices()
+        self.wake_notices()
         return answer
 
     async def recover(self, event: Event) -> str:
@@ -1020,6 +1108,8 @@ class Service:
                 task = await Store.task(account.id)
                 if task is not None and task.status in ("active", "paused") and task.owner_id != binding.id:
                     raise WuwaError("任务属于另一用户，请由任务所属用户恢复。")
+                if task is not None and task.status == "active":
+                    await self.pause_invalid_route(task)
                 pending = account.token_state == "recovering"
                 exchanged = pending
                 info = None
@@ -1071,11 +1161,14 @@ class Service:
                                 "保存的SDK凭据已被拒绝，请发送 wt登录 或 wt添加token 更新登录态。"
                             ) from None
                         raise
+                    previous_token = account.token
                     account.token = token.token
                     account.token_state = "recovering"
                     account.token_expires_at = 0
                     account.token_renew_after = 0
                     await Store.save(account)
+                    if previous_token and previous_token != token.token:
+                        self.api.retire_token(previous_token)
                     try:
                         account.token_expires_at = token_expiry(token.expire_time)
                         await Store.save(account)
@@ -1121,14 +1214,17 @@ class Service:
                     await self.finish(task, "expired", "本轮已到期")
                     answer = prefix + "原任务已到期，可发送 wt宝箱 开启新任务。"
                 else:
+                    route = await Store.subscription(task.subscription_id)
+                    if task.pause_reason == "route" or route is None or not route.WS_BOT_ID:
+                        async with self.subscription(event, "WuwaTappo宝箱", new_id()) as subscription_id:
+                            task.subscription_id = subscription_id
+                            await Store.save(task)
                     if task.paused_at is not None:
                         task.expires_at += time.time() - task.paused_at
                     task.paused_at = None
                     task.status = "active"
                     task.pause_reason = ""
-                    task.failures = 0
                     await self.failures.reset_account(account.id)
-                    await Store.reset_notice_attempts(account.id)
                     task.next_check = self.next_wakeup(task, info)
                     await Store.save(
                         task,
@@ -1140,14 +1236,13 @@ class Service:
                     )
                     self.schedule(task)
                     answer = prefix + "宝箱任务已恢复，继续原轮次。\n" + task_text(task)
-        await self.flush_notices()
+        self.wake_notices()
         return answer
 
     async def record_success(self, task: ChestTask, record: ChestRecord) -> None:
         record.state = "success"
         if task.run_id == record.run_id:
             task.successes += 1
-            task.failures = 0
         await Store.save(record, task)
         await self.failures.success("check:" + task.account_id)
         await self.queue_results(record.account_id)
@@ -1214,6 +1309,8 @@ class Service:
         supplement = ""
         # 最多一次自动补充、一次重试；每次真正发请求前都检查到期时间。
         for attempt in range(2):
+            if self.closing:
+                return info
             self.check_deadline(task)
             record = ChestRecord(
                 account_id=account.id,
@@ -1224,12 +1321,18 @@ class Service:
                 supplement=supplement,
             )
             await Store.save(record)
-            if time.time() >= task.expires_at:
+            if self.closing or time.time() >= task.expires_at:
                 record.state = "not_sent"
                 await Store.save(record)
+                if self.closing:
+                    return info
                 raise Expired
             try:
                 result = await self.api.open(account.token, side, info.total_click_count)
+            except OperationStopped:
+                record.state = "not_sent"
+                await Store.save(record)
+                return info
             except MaintenanceError as error:
                 record.state = "rejected"
                 record.result = str(error)
@@ -1271,6 +1374,7 @@ class Service:
             return fresh
         raise RuntimeError("开箱重试流程没有产生结果")
 
+    @tracked_method
     @with_read_cache
     async def tick(self, key: str) -> None:
         if self.closing or not self.database_ready:
@@ -1278,7 +1382,7 @@ class Service:
         attempts_before = self.failures.attempts("check:" + key)
         try:
             await self._check_account(key)
-            await self.flush_notices()
+            self.wake_notices()
         except SQLAlchemyError as error:
             await self.disable_database(error)
         except MaintenanceError:
@@ -1309,7 +1413,9 @@ class Service:
                 if task.remaining() <= 0:
                     await self.finish(task, "expired", "本轮自动开箱已结束")
                     return
-                if task.status == "paused" and task.pause_reason == "auth":
+                if await self.pause_invalid_route(task):
+                    return
+                if task.status == "paused" and task.pause_reason in ("auth", "route"):
                     return
                 if not task.reminded and task.expires_at - time.time() <= RENEW_WINDOW:
                     task.reminded = True
@@ -1334,10 +1440,11 @@ class Service:
                 info = await self.refresh(account)
                 if not await self.reconcile(task, info):
                     await self.failures.success("check:" + key)
-                    task.failures = 0
                     retry = True
                     return
                 for side in ("left", "right"):
+                    if self.closing:
+                        break
                     self.check_deadline(task)
                     if info.cooldown(side) > time.time():
                         continue
@@ -1353,7 +1460,8 @@ class Service:
                         retry = True
                         break
                 await self.failures.success("check:" + key)
-                task.failures = 0
+            except OperationStopped:
+                return
             except Expired:
                 await self.finish(task, "expired", "本轮自动开箱已结束")
             except MaintenanceError:
@@ -1425,31 +1533,44 @@ class Service:
 
     async def restore(self) -> None:
         for snapshot in await Store.active_tasks():
-            async with self.account_lock(snapshot.account_id):
-                # 启动后命令已可能进入，锁内重读，避免覆盖用户刚完成的续期/暂停。
-                task = await Store.task(snapshot.account_id)
-                if task is not None and task.status in ("active", "paused"):
-                    account = await Store.account(task.account_id)
-                    if account is not None and account.token_state == "expired":
-                        if task.status == "active":
-                            task.status = "paused"
-                            task.pause_reason = "auth"
-                            await Store.save(task)
-                        self.schedule(task)
-                        continue
-                    if self.failures.blocked("check:" + task.account_id) or self.failures.blocked(
-                        "save:" + task.account_id
-                    ):
-                        task.status = "paused"
-                        task.pause_reason = "failure"
-                    if task.timer_paused:
-                        self.unschedule(task.account_id)
-                        continue
-                    # 不改变 started_at / expires_at；停机期间不补开历史轮次。
-                    task.next_check = time.time()
-                    await Store.save(task)
-                    self.schedule(task)
+            try:
+                await self.restore_account(snapshot.account_id)
+            except (DatabaseWriteTimeout, WriteGateTimeout) as error:
+                await self.failures.fail(
+                    "restore:" + snapshot.account_id,
+                    "启动任务恢复",
+                    self.error_detail(error),
+                    snapshot.account_id,
+                    limit=1,
+                )
 
+    async def restore_account(self, key: str) -> None:
+        async with self.account_lock(key):
+            # 启动后命令已可能进入，锁内重读，避免覆盖用户刚完成的续期/暂停。
+            task = await Store.task(key)
+            if task is not None and task.status in ("active", "paused"):
+                account = await Store.account(task.account_id)
+                if account is not None and account.token_state == "expired":
+                    if task.status == "active":
+                        task.status = "paused"
+                        task.pause_reason = "auth"
+                        await Store.save(task)
+                    self.schedule(task)
+                    return
+                if self.failures.blocked("check:" + task.account_id) or self.failures.blocked(
+                    "save:" + task.account_id
+                ):
+                    task.status = "paused"
+                    task.pause_reason = "failure"
+                if task.timer_paused:
+                    self.unschedule(task.account_id)
+                    return
+                # 不改变 started_at / expires_at；停机期间不补开历史轮次。
+                task.next_check = time.time()
+                await Store.save(task)
+                self.schedule(task)
+
+    @tracked_method
     async def archive_history(self) -> None:
         if self.closing or not self.database_ready:
             return
@@ -1471,13 +1592,25 @@ class Service:
                     return
                 archived = await HistoryArchive.archive_batch(cutoff, daily_cutoff)
                 cleaned = await HistoryArchive.cleanup_batch(cutoff, daily_cutoff)
-                records += archived
+                records += archived.archived
                 other += cleaned
-                if not archived and not cleaned:
+                if archived.quarantined:
+                    logger.error(
+                        f"[WuwaTappoUID] 已隔离异常开箱流水 {len(archived.quarantined)} 条，"
+                        f"流水ID {','.join(archived.quarantined[:10])}。"
+                    )
+                    await self.failures.fail(
+                        "history-data",
+                        "开箱详情异常",
+                        "异常原始流水已保留，请检查 archive_error 并修正详情。",
+                        limit=1,
+                    )
+                await self.cleanup_subscriptions()
+                if not archived.processed and not cleaned:
                     break
                 await asyncio.sleep(0.1)
             # 有积压时下分钟继续，空闲时每小时检查；配置变化在下一次分钟巡检生效。
-            self._archive_next = time.time() + (60 if archived or cleaned else 3600)
+            self._archive_next = time.time() + (60 if archived.processed or cleaned else 3600)
             await self.failures.success("history")
             if records or other:
                 logger.info(
@@ -1490,6 +1623,7 @@ class Service:
                 logger.exception("[WuwaTappoUID] 历史归档出现异常")
             await self.failures.fail("history", "历史归档", self.error_detail(error), delay=300)
 
+    @tracked_method
     @with_read_cache
     async def maintain(self) -> None:
         """每分钟执行：补排丢失了下次检查的任务，再补发待提交的通知。"""
@@ -1498,8 +1632,9 @@ class Service:
         if not self.failures.allows("maintain"):
             return
         try:
-            await Store.prepare_login_sessions()
             await self._maintain()
+            await self.cards.prune_caches()
+            await self.cleanup_subscriptions()
             await self.failures.success("maintain")
         except SQLAlchemyError as error:
             await self.disable_database(error)
@@ -1525,6 +1660,7 @@ class Service:
                     logger.warning("[WuwaTappoUID] 发现没有排期的宝箱任务，已重新安排检查。")
                     task.next_check = time.time()
                     self.schedule(task)
+                    await self.failures.success("restore:" + key)
             for key in await Store.unresolved_accounts():
                 if self.account_lock(key).locked() or not self.failures.allows("reconcile:" + key):
                     continue
@@ -1572,7 +1708,7 @@ class Service:
                         continue
                     except Exception as error:
                         await self.failures.fail("results:" + key, "开箱结果汇总", self.error_detail(error), key)
-        await self.flush_notices()
+        self.wake_notices()
 
     def release_notice_image(self, key: str) -> None:
         if key in self._notice_images:
@@ -1627,6 +1763,7 @@ class Service:
                 messages.append(MessageSegment.image(tile))
         return messages
 
+    @tracked_method
     async def flush_notices(self) -> None:
         if self.closing or not self.database_ready:
             return
@@ -1645,108 +1782,197 @@ class Service:
             await self.failures.fail("notice_loop", "通知巡检", self.error_detail(error))
 
     async def _flush_notices(self) -> None:
+        if self._push_lock.locked():
+            self._notice_again = True
+            return
         async with self._push_lock:
-            if self.closing or not self.database_ready or not gss.active_bot:
-                return
-            # 同一订阅仍指向原任务和会话，离线积压的多张图也一起补发。
-            groups: dict[int, list[Notice]] = {}
-            for notice in await Store.notices():
-                groups.setdefault(notice.subscription_id, []).append(notice)
-            for subscription_id, batch in groups.items():
-                account_id = batch[0].account_id
-                send_key = f"notice:{account_id}:{subscription_id}"
-                render_key = f"render:{account_id}:{subscription_id}"
-                if not self.failures.allows(send_key):
-                    continue
-                sub = await Store.subscription(subscription_id)
-                if sub is None or not sub.WS_BOT_ID:
-                    await self.failures.fail(send_key, "结果通知发送", "通知订阅路由不存在", account_id)
-                    continue
-                event = Event(
-                    bot_id=sub.bot_id,
-                    user_id=sub.user_id,
-                    bot_self_id=sub.bot_self_id,
-                    user_type=sub.user_type,
-                    group_id=sub.group_id,
-                )
-                contents: list[Message] = []
-                accounts: dict[str, Account | None] = {}
-                contexts: dict[str, ResultContext] = {}
-                if not self.failures.blocked(render_key) and not self.failures.allows(render_key):
-                    continue
-                if not self.failures.blocked(render_key):
-                    try:
-                        for notice in batch:
-                            key = notice.account_id
-                            if key not in accounts:
-                                accounts[key] = await Store.account(key)
-                            if (
-                                notice.record_ids
-                                and key not in contexts
-                                and self.cached_notice_image(notice.id) is None
-                            ):
-                                account = accounts[key]
-                                if account is None:
-                                    raise DataError("开箱通知对应的账号不存在。")
-                                contexts[key] = await self.cards.result_context(account, event)
-                                unchecked = [
-                                    n for n in batch if n.account_id == key and n.record_ids and not n.new_checked
-                                ]
-                                if unchecked:
-                                    async with self.account_lock(key):
-                                        await Store.prepare_new_items(
-                                            key, [n.id for n in unchecked], contexts[key].owned
-                                        )
-                                    for row in unchecked:
-                                        row.new_checked = True
-                            contents.extend(await self.notice_messages(notice, event, accounts[key], contexts))
-                        await self.failures.success(render_key)
-                    except SQLAlchemyError:
-                        raise
-                    except MaintenanceError:
-                        continue
-                    except Exception as error:
-                        if self.failures.attempts(render_key) == 0:
-                            logger.exception("[WuwaTappoUID] 通知图片绘制失败")
-                        failure = await self.failures.fail(
-                            render_key, "通知图片绘制", self.error_detail(error), account_id
+            self._notice_again = False
+            semaphore = asyncio.Semaphore(4)
+
+            async def prepare(key: str) -> None:
+                async with semaphore:
+                    await self._flush_account_notices(key)
+
+            cursor = None
+            until = time.time()
+            while not self.closing:
+                accounts = await Store.notice_accounts(until, after=cursor)
+                if not accounts:
+                    break
+                outcomes = await asyncio.gather(*(prepare(key) for key, _ in accounts), return_exceptions=True)
+                for (key, _), outcome in zip(accounts, outcomes, strict=True):
+                    if isinstance(outcome, SQLAlchemyError):
+                        await self.disable_database(outcome)
+                        return
+                    if isinstance(outcome, Exception):
+                        await self.failures.fail(
+                            "notice-account:" + key, "账号通知处理", self.error_detail(outcome), key
                         )
-                        if not failure.blocked:
-                            continue
-                if self.failures.blocked(render_key):
-                    contents = [MessageSegment.text("结果图片持续绘制失败，本组改为文字通知；已保存的开箱流水保留。\n")]
-                    for notice in batch:
-                        cuid = notice.account_id.split(":", 1)[-1]
-                        text = notice.text.replace(cuid, mask_cuid(cuid))
-                        contents.append(MessageSegment.text(f"CUID {mask_cuid(cuid)}：{text}\n"))
-                # 多图用一个合并转发；单图照常发送。艾特仅放在外层一次。
-                messages = [MessageSegment.node(contents)] if sum(m.type == "image" for m in contents) > 1 else contents
-                if sub.user_type == "group":
-                    messages = [MessageSegment.at(sub.user_id), MessageSegment.text("\n"), *messages]
-                for notice in batch:
-                    notice.attempts += 1
-                # 提交前保存次数；结果不明或重启也不会增加发送预算。
-                await Store.save(*batch)
+                last_key, last_time = accounts[-1]
+                cursor = last_time, last_key
+        if self._notice_again:
+            self.wake_notices(5)
+
+    async def _flush_account_notices(self, key: str) -> None:
+        if self.closing or not self.database_ready:
+            return
+        if not self.failures.allows("notice-account:" + key):
+            return
+        batch = await Store.notices(key)
+        groups: dict[int, list[Notice]] = {}
+        for notice in batch:
+            groups.setdefault(notice.subscription_id, []).append(notice)
+        available: dict[int, tuple[Event, list[Notice]]] = {}
+        for subscription_id, notices in groups.items():
+            sub = await Store.subscription(subscription_id)
+            if sub is None or not sub.WS_BOT_ID:
+                ended = await Store.mark_unroutable(subscription_id)
+                if ended:
+                    for notice in ended:
+                        self.release_notice_image(notice.id)
+                    await self.failures.fail(
+                        f"route:{subscription_id}",
+                        "通知路由失效",
+                        "通知已标记无法投递，原始结果保留至归档。",
+                        key,
+                        limit=1,
+                    )
+                if key and not self.account_lock(key).locked():
+                    async with self.account_lock(key):
+                        task = await Store.task(key)
+                        if task is not None and task.subscription_id == subscription_id:
+                            await self.pause_invalid_route(task)
+                continue
+            if sub.WS_BOT_ID not in gss.active_bot:
+                continue
+            event = Event(
+                bot_id=sub.bot_id,
+                user_id=sub.user_id,
+                bot_self_id=sub.bot_self_id,
+                user_type=sub.user_type,
+                group_id=sub.group_id,
+                WS_BOT_ID=sub.WS_BOT_ID,
+            )
+            available[subscription_id] = event, notices
+        if not available:
+            return
+        account = await Store.account(key) if key else None
+        progress = None
+        unchecked = [notice for notice in batch if notice.record_ids and not notice.new_checked]
+        needs_context = any(notice.record_ids for _, notices in available.values() for notice in notices)
+        if needs_context:
+            if account is None:
+                raise DataError("开箱通知对应的账号不存在。")
+            if self.account_lock(key).locked():
+                self._notice_again = True
+                return
+            async with self.account_lock(key):
+                account = await Store.account(key)
+                if account is None:
+                    raise DataError("开箱通知对应的账号不存在。")
+                unchecked = [
+                    notice for notice in await Store.notices(key) if notice.record_ids and not notice.new_checked
+                ]
                 try:
-                    async with asyncio.timeout(15):
-                        submitted = await sub.send(messages)
-                    if submitted != 0:
-                        raise NetworkError("GS 未能提交推送，Bot可能离线。")
-                except SQLAlchemyError:
-                    raise
-                except Exception as error:
-                    for notice in batch:
-                        notice.last_error = f"推送异常：{type(error).__name__}"
-                    await Store.save(*batch)
-                    await self.failures.fail(send_key, "结果通知发送", self.error_detail(error), account_id)
-                    continue
-                submitted_at = time.time()
-                for notice in batch:
-                    notice.submitted = True
-                    notice.submitted_at = submitted_at
-                    notice.last_error = ""
-                # 整组合并消息共同标记提交，不会只标记其中一页。
-                await Store.save(*batch)
-                await self.failures.success(send_key)
-                for notice in batch:
-                    self.release_notice_image(notice.id)
+                    if not self.failures.allows("notice-bag:" + key):
+                        if not self.failures.blocked("notice-bag:" + key):
+                            return
+                        items = None
+                    else:
+                        async with asyncio.timeout(12):
+                            items = await self.api.bags(account.token, fresh=True)
+                    if items is not None:
+                        progress = self.cards.progress(items)
+                        owned = {str(item.asset_id) for item in items if item.quantity > 0}
+                        if unchecked:
+                            await Store.prepare_new_items(key, [notice.id for notice in unchecked], owned)
+                        await self.failures.success("notice-bag:" + key)
+                except (WuwaError, TimeoutError) as error:
+                    failure = await self.failures.fail(
+                        "notice-bag:" + key,
+                        "通知背包快照",
+                        self.error_detail(error),
+                        key,
+                    )
+                    if unchecked and not failure.blocked:
+                        return
+        for subscription_id, (event, notices) in available.items():
+            gate = self._notice_sends.setdefault(subscription_id, NoticeSendGate(asyncio.Lock()))
+            gate.users += 1
+            try:
+                async with gate.lock:
+                    await self._send_notice_group(
+                        key, subscription_id, event, notices, account, progress, bool(unchecked)
+                    )
+            finally:
+                gate.users -= 1
+                if not gate.users:
+                    del self._notice_sends[subscription_id]
+        await self.failures.success("notice-account:" + key)
+
+    async def _send_notice_group(
+        self,
+        key: str,
+        subscription_id: int,
+        event: Event,
+        notices: list[Notice],
+        account: Account | None,
+        progress: list[Progress] | None,
+        unchecked: bool,
+    ) -> None:
+        if self.closing:
+            return
+        send_key = f"notice:{key}:{subscription_id}"
+        render_key = f"render:{key}:{subscription_id}"
+        if not self.failures.allows(send_key):
+            return
+        if not self.failures.blocked(render_key) and not self.failures.allows(render_key):
+            return
+        contexts = {}
+        contents: list[Message] = []
+        if not self.failures.blocked(render_key) and not (unchecked and self.failures.blocked("notice-bag:" + key)):
+            try:
+                if any(notice.record_ids for notice in notices) and account is not None:
+                    contexts[key] = ResultContext(await self.cards.header(account, None, event), progress)
+                for notice in notices:
+                    contents.extend(await self.notice_messages(notice, event, account, contexts))
+                await self.failures.success(render_key)
+            except SQLAlchemyError:
+                raise
+            except MaintenanceError:
+                return
+            except Exception as error:
+                if self.failures.attempts(render_key) == 0:
+                    logger.exception("[WuwaTappoUID] 通知图片绘制失败")
+                failure = await self.failures.fail(render_key, "通知图片绘制", self.error_detail(error), key)
+                if not failure.blocked:
+                    return
+        if not contents or self.failures.blocked(render_key):
+            contents = [MessageSegment.text("结果图片暂不可用，本组改为文字通知；开箱流水已保留。\n")]
+            for notice in notices:
+                text = notice.text.replace(account.cuid, mask_cuid(account.cuid)) if account else notice.text
+                contents.append(MessageSegment.text(text + "\n"))
+        messages = [MessageSegment.node(contents)] if sum(m.type == "image" for m in contents) > 1 else contents
+        if event.user_type == "group":
+            messages = [MessageSegment.at(event.user_id), MessageSegment.text("\n"), *messages]
+        ids = [notice.id for notice in notices]
+        await Store.notice_attempts(ids)
+        try:
+            sub = await Store.subscription(subscription_id)
+            if sub is None or not sub.WS_BOT_ID:
+                self._notice_again = True
+                return
+            async with asyncio.timeout(15):
+                submitted = await sub.send(messages)
+            if submitted != 0:
+                raise NetworkError("GS 未能提交推送，Bot可能离线。")
+        except SQLAlchemyError:
+            raise
+        except Exception as error:
+            await Store.notice_error(ids, f"推送异常：{type(error).__name__}")
+            await self.failures.fail(send_key, "结果通知发送", self.error_detail(error), key)
+            return
+        await Store.mark_submitted(ids)
+        await self.failures.success(send_key)
+        for notice in notices:
+            self.release_notice_image(notice.id)

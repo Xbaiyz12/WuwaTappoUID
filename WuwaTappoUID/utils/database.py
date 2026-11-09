@@ -1,5 +1,6 @@
 """插件专属表和 GS 数据库会话封装。"""
 
+import hashlib
 import json
 import time
 from uuid import uuid4
@@ -10,7 +11,23 @@ from gsuid_core.utils.database import base_models
 from gsuid_core.utils.database.base_models import with_read_session, with_session
 from gsuid_core.utils.database.models import CoreUser, Subscribe
 from gsuid_core.utils.database.startup import exec_list
-from sqlalchemy import Column, Connection, Index, Text, func, inspect, literal, text, union_all
+from sqlalchemy import (
+    Column,
+    Connection,
+    Float,
+    Index,
+    String,
+    Text,
+    delete,
+    func,
+    inspect,
+    literal,
+    or_,
+    text,
+    union_all,
+    update,
+)
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import Field, SQLModel, col, select
 
@@ -19,6 +36,10 @@ from .schema import DatabaseSchemaError, DataError, OpenResult
 
 def new_id() -> str:
     return uuid4().hex
+
+
+def login_notice_id(key: str, phase: str) -> str:
+    return hashlib.sha256(f"login:{key}:{phase}".encode()).hexdigest()[:32]
 
 
 class Account(SQLModel, table=True):
@@ -128,6 +149,8 @@ class ChestRecord(SQLModel, table=True):
         Index("ix_wt_chest_record_recent", "account_id", "run_id", "side", "created_at"),
         Index("ix_wt_chest_record_history", "account_id", "created_at"),
         Index("ix_wt_chest_record_retention", "created_at"),
+        Index("ix_wt_chest_record_notice", "notice_id"),
+        Index("ix_wt_chest_record_archive", "archive_error", "created_at", "id"),
         {"extend_existing": True},
     )
     id: str = Field(default_factory=new_id, primary_key=True, max_length=32)
@@ -142,11 +165,16 @@ class ChestRecord(SQLModel, table=True):
     fresh: bool = False
     supplement: str = Field(default="", sa_column=Column(Text, nullable=False))
     notice_id: str = Field(default="", max_length=32)
+    archive_error: str = Field(default="", sa_column=Column(String(160), nullable=False, server_default=""))
 
 
 class Notice(SQLModel, table=True):
     __tablename__ = "wt_notice"
-    __table_args__ = (Index("ix_wt_notice_retention", "submitted", "submitted_at"), {"extend_existing": True})
+    __table_args__ = (
+        Index("ix_wt_notice_pending", "delivery_state", "created_at", "account_id"),
+        Index("ix_wt_notice_finished", "delivery_state", "finished_at"),
+        {"extend_existing": True},
+    )
     id: str = Field(default_factory=new_id, primary_key=True, max_length=32)
     subscription_id: int = Field(index=True)
     account_id: str = Field(index=True, max_length=64)
@@ -157,6 +185,10 @@ class Notice(SQLModel, table=True):
     rarity: str = Field(default="", max_length=32)
     submitted: bool = Field(default=False, index=True)
     submitted_at: float | None = None
+    delivery_state: str = Field(
+        default="pending", sa_column=Column(String(16), nullable=False, server_default="pending")
+    )
+    finished_at: float | None = Field(default=None, sa_column=Column(Float, nullable=True))
     new_checked: bool = False
     attempts: int = 0
     last_error: str = Field(default="", max_length=160)
@@ -222,6 +254,7 @@ ADDED_COLUMNS = {
     "wt_chest_record": {
         "notice_id": "VARCHAR(32) NOT NULL DEFAULT 'legacy'",
         "fresh": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "archive_error": "VARCHAR(160) NOT NULL DEFAULT ''",
     },
     "wt_notice": {
         "asset_id": "VARCHAR(32) NOT NULL DEFAULT ''",
@@ -229,6 +262,8 @@ ADDED_COLUMNS = {
         "record_ids": "TEXT NOT NULL DEFAULT ''",
         "available_clicks": "BIGINT DEFAULT NULL",
         "new_checked": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "delivery_state": "VARCHAR(16) NOT NULL DEFAULT 'pending'",
+        "finished_at": "FLOAT DEFAULT NULL",
     },
 }
 exec_list.extend(
@@ -273,6 +308,26 @@ def _ensure_schema(connection: Connection) -> list[str]:
         missing.extend(f"{table.name}.{column.name}" for column in table.columns if column.name not in existing)
     if missing:
         raise DatabaseSchemaError(f"插件数据库缺少字段：{'、'.join(missing)}；后台任务不会启动。")
+    connection.execute(
+        text(
+            "UPDATE wt_notice SET delivery_state = 'submitted', "
+            "finished_at = COALESCE(submitted_at, created_at) "
+            "WHERE submitted = TRUE AND delivery_state = 'pending'"
+        )
+    )
+    connection.execute(
+        text(
+            "INSERT INTO wt_account_link (owner_id, account_id) "
+            "SELECT b.id, b.account_id FROM wt_binding b JOIN wt_account a ON a.id = b.account_id "
+            "WHERE NOT EXISTS (SELECT 1 FROM wt_account_link l WHERE l.owner_id = b.id AND l.account_id = b.account_id)"
+        )
+    )
+    connection.execute(
+        text(
+            "UPDATE wt_account SET token_state = CASE WHEN token = '' THEN 'expired' ELSE 'pending' END "
+            "WHERE token_state = 'login_unconfirmed'"
+        )
+    )
     # create_all 跳过已有表时也跳过新增索引，升级时单独创建。
     for table in tables:
         for index in table.indexes:
@@ -317,54 +372,87 @@ class Store:
         return list((await session.execute(query)).scalars().all())
 
     @classmethod
-    @with_session
-    async def prepare_login_sessions(cls, session: AsyncSession, *, startup: bool = False) -> None:
-        now = time.time()
-        rows = (await session.execute(select(LoginSession))).scalars().all()
-        for row in rows:
-            if row.expires_at < now - 24 * 3600:
-                pending = await session.scalar(
-                    select(func.count())
-                    .select_from(Notice)
-                    .where(col(Notice.subscription_id) == row.subscription_id, col(Notice.submitted).is_(False))
-                )
-                if pending:
-                    continue
-                subscription = await session.get(Subscribe, row.subscription_id)
-                if subscription is not None and subscription.task_name == "WuwaTappo登录":
-                    await session.delete(subscription)
-                await session.delete(row)
-            elif row.expires_at <= now and row.status in ("pending", "verifying"):
-                row.status = "expired"
-                row.submission = ""
-                row.external_result_pending = False
-                row.message = "登录链接已过期，请重新发送 wt登录。"
-                session.add(row)
-                session.add(Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message))
-            elif startup and row.status == "processing":
-                row.status = "failed"
-                row.submission = ""
-                row.message = "登录处理已中断，请重新发送 wt登录。"
-                session.add(row)
-                session.add(Notice(subscription_id=row.subscription_id, account_id=row.account_id, text=row.message))
+    @with_read_session
+    async def login_candidates(
+        cls, session: AsyncSession, now: float, *, startup: bool = False, protected_ids: tuple[str, ...] = ()
+    ) -> list[LoginSession]:
+        unfinished = col(LoginSession.status).in_(["pending", "verifying", "processing"])
+        due = (LoginSession.expires_at <= now) & unfinished
         if startup:
-            accounts = (
-                (await session.execute(select(Account).where(col(Account.token_state) == "login_unconfirmed")))
-                .scalars()
-                .all()
-            )
-            for account in accounts:
-                account.token_state = "pending" if account.token else "expired"
-                session.add(account)
+            due = due | (LoginSession.status == "processing")
+        query = select(LoginSession).where(due)
+        if protected_ids:
+            query = query.where(col(LoginSession.id).not_in(protected_ids))
+        result = await session.execute(query.order_by(col(LoginSession.expires_at), col(LoginSession.id)).limit(100))
+        return list(result.scalars().all())
 
     @classmethod
     @with_session
-    async def reset_notice_attempts(cls, session: AsyncSession, account_id: str) -> None:
+    async def finish_login(cls, session: AsyncSession, key: str, now: float, *, startup: bool = False) -> bool:
+        row = await session.get(LoginSession, key)
+        if row is None or row.status not in ("pending", "verifying", "processing"):
+            return False
+        if row.expires_at > now and not (startup and row.status == "processing"):
+            return False
+        interrupted = row.status == "processing"
+        status = "failed" if interrupted else "expired"
+        message = "登录处理已中断，请重新发送 wt登录。" if interrupted else "登录链接已过期，请重新发送 wt登录。"
+        deadline = LoginSession.expires_at <= now
+        if startup:
+            deadline = or_(deadline, LoginSession.status == "processing")
         result = await session.execute(
-            select(Notice).where(col(Notice.account_id) == account_id, col(Notice.submitted).is_(False))
+            update(LoginSession)
+            .where(LoginSession.id == key, LoginSession.status == row.status, deadline)
+            .values(status=status, submission="", message=message, external_result_pending=False)
+            .execution_options(synchronize_session=False)
         )
-        for notice in result.scalars().all():
-            notice.attempts = 0
+        if not isinstance(result, CursorResult):
+            raise TypeError("登录结束更新没有返回数据库写入结果")
+        if result.rowcount != 1:
+            return False
+        notice_id = login_notice_id(key, status)
+        if await session.get(Notice, notice_id) is None:
+            session.add(
+                Notice(id=notice_id, subscription_id=row.subscription_id, account_id=row.account_id, text=message)
+            )
+        return True
+
+    @classmethod
+    @with_read_session
+    async def login_cleanup_candidates(cls, session: AsyncSession, now: float) -> list[LoginSession]:
+        pending = (
+            select(Notice.id)
+            .where(Notice.subscription_id == LoginSession.subscription_id, Notice.delivery_state == "pending")
+            .correlate(LoginSession)
+            .exists()
+        )
+        result = await session.execute(
+            select(LoginSession)
+            .where(
+                LoginSession.expires_at < now - 24 * 3600,
+                col(LoginSession.status).not_in(["pending", "verifying", "processing"]),
+                ~pending,
+            )
+            .order_by(col(LoginSession.expires_at), col(LoginSession.id))
+            .limit(100)
+        )
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_session
+    async def cleanup_login(cls, session: AsyncSession, key: str, now: float) -> bool:
+        row = await session.get(LoginSession, key)
+        if row is None or row.expires_at >= now - 24 * 3600 or row.status in ("pending", "verifying", "processing"):
+            return False
+        pending = await session.scalar(
+            select(Notice.id)
+            .where(Notice.subscription_id == row.subscription_id, Notice.delivery_state == "pending")
+            .limit(1)
+        )
+        if pending is not None:
+            return False
+        await session.delete(row)
+        return True
 
     @classmethod
     @with_read_session
@@ -438,15 +526,8 @@ class Store:
         return list(result.scalars().all())
 
     @classmethod
-    @with_session
+    @with_read_session
     async def linked_accounts(cls, session: AsyncSession, owner_id: str) -> list[Account]:
-        # 旧版本只保存当前绑定；补齐这一条现有关系，不回填已删除账号或历史任务。
-        binding = await session.get(Binding, owner_id)
-        if binding is not None and await session.get(Account, binding.account_id) is not None:
-            current_link = await session.get(AccountLink, (owner_id, binding.account_id))
-            if current_link is None:
-                session.add(AccountLink(owner_id=owner_id, account_id=binding.account_id))
-                await session.flush()
         result = await session.execute(
             select(Account)
             .join(AccountLink, col(AccountLink.account_id) == col(Account.id))
@@ -481,12 +562,17 @@ class Store:
     async def prepare_new_items(
         cls, session: AsyncSession, account_id: str, notice_ids: list[str], owned: set[str] | None
     ) -> None:
+        if owned is None:
+            return
         account = await session.get(Account, account_id)
         if account is None:
             raise DataError("开箱通知对应的账号不存在。")
         result = await session.execute(
             select(Notice).where(
-                Notice.account_id == account_id, col(Notice.id).in_(notice_ids), col(Notice.new_checked).is_(False)
+                Notice.account_id == account_id,
+                col(Notice.id).in_(notice_ids),
+                col(Notice.new_checked).is_(False),
+                Notice.delivery_state == "pending",
             )
         )
         notices = list(result.scalars().all())
@@ -499,15 +585,14 @@ class Store:
             .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
         )
         # 首次通知仅建立基线；积压的多组结果一起比较，避免更新快照后漏掉后续组的NEW。
-        new_ids = owned - set(json.loads(account.bag_snapshot)) if owned is not None and account.bag_snapshot else set()
+        new_ids = owned - set(json.loads(account.bag_snapshot)) if account.bag_snapshot else set()
         for record in result.scalars().all():
             asset_id = str(OpenResult.model_validate_json(record.result).asset_id) if record.result else ""
             record.fresh = asset_id in new_ids
             new_ids.discard(asset_id)
             session.add(record)
-        if owned is not None:
-            account.bag_snapshot = json.dumps(sorted(owned), separators=(",", ":"))
-            session.add(account)
+        account.bag_snapshot = json.dumps(sorted(owned), separators=(",", ":"))
+        session.add(account)
         for notice in notices:
             notice.new_checked = True
             session.add(notice)
@@ -603,11 +688,108 @@ class Store:
 
     @classmethod
     @with_read_session
-    async def notices(cls, session: AsyncSession) -> list[Notice]:
-        result = await session.execute(
-            select(Notice).where(col(Notice.submitted).is_(False)).order_by(col(Notice.created_at), col(Notice.id))
+    async def notice_accounts(
+        cls, session: AsyncSession, until: float, limit: int = 100, after: tuple[float, str] | None = None
+    ) -> list[tuple[str, float]]:
+        first_at = func.min(col(Notice.created_at))
+        query = (
+            select(Notice.account_id, first_at)
+            .where(Notice.delivery_state == "pending", Notice.created_at <= until)
+            .group_by(col(Notice.account_id))
         )
+        if after is not None:
+            created_at, account_id = after
+            query = query.having(
+                or_(first_at > created_at, (first_at == created_at) & (Notice.account_id > account_id))
+            )
+        result = await session.execute(query.order_by(first_at, col(Notice.account_id)).limit(limit))
+        return [(account_id, created_at) for account_id, created_at in result.all()]
+
+    @classmethod
+    @with_read_session
+    async def notices(
+        cls, session: AsyncSession, account_id: str | None = None, subscription_id: int | None = None
+    ) -> list[Notice]:
+        query = select(Notice).where(Notice.delivery_state == "pending")
+        if account_id is not None:
+            query = query.where(Notice.account_id == account_id)
+        if subscription_id is not None:
+            query = query.where(Notice.subscription_id == subscription_id)
+        result = await session.execute(query.order_by(col(Notice.created_at), col(Notice.id)))
         return list(result.scalars().all())
+
+    @classmethod
+    @with_session
+    async def mark_unroutable(cls, session: AsyncSession, subscription_id: int) -> list[Notice]:
+        subscription = await session.get(Subscribe, subscription_id)
+        if subscription is not None and subscription.WS_BOT_ID:
+            return []
+        result = await session.execute(
+            select(Notice).where(Notice.subscription_id == subscription_id, Notice.delivery_state == "pending")
+        )
+        rows = list(result.scalars().all())
+        now = time.time()
+        for row in rows:
+            row.delivery_state = "unroutable"
+            row.finished_at = now
+            row.last_error = "通知订阅已删除" if subscription is None else "通知订阅缺少机器人标识"
+            session.add(row)
+        return rows
+
+    @classmethod
+    @with_session
+    async def notice_attempts(cls, session: AsyncSession, ids: list[str]) -> None:
+        await session.execute(
+            update(Notice)
+            .where(col(Notice.id).in_(ids), Notice.delivery_state == "pending")
+            .values(attempts=col(Notice.attempts) + 1)
+            .execution_options(synchronize_session=False)
+        )
+
+    @classmethod
+    @with_session
+    async def mark_submitted(cls, session: AsyncSession, ids: list[str]) -> None:
+        now = time.time()
+        await session.execute(
+            update(Notice)
+            .where(col(Notice.id).in_(ids), Notice.delivery_state == "pending")
+            .values(submitted=True, submitted_at=now, delivery_state="submitted", finished_at=now, last_error="")
+            .execution_options(synchronize_session=False)
+        )
+
+    @classmethod
+    @with_session
+    async def notice_error(cls, session: AsyncSession, ids: list[str], message: str) -> None:
+        await session.execute(
+            update(Notice)
+            .where(col(Notice.id).in_(ids), Notice.delivery_state == "pending")
+            .values(last_error=message[:160])
+            .execution_options(synchronize_session=False)
+        )
+
+    @classmethod
+    @with_session
+    async def cleanup_subscriptions(
+        cls, session: AsyncSession, subscription_ids: list[int] | None = None, limit: int = 100
+    ) -> int:
+        references = or_(
+            *(
+                select(model.subscription_id).where(model.subscription_id == Subscribe.id).correlate(Subscribe).exists()
+                for model in (ChestTask, ChestRecord, Notice, LoginSession)
+            )
+        )
+        query = select(Subscribe.id).where(
+            col(Subscribe.task_name).in_(["WuwaTappo宝箱", "WuwaTappo登录"]), ~references
+        )
+        if subscription_ids is not None:
+            query = query.where(col(Subscribe.id).in_(subscription_ids))
+        result = await session.execute(query.order_by(col(Subscribe.id)).limit(limit))
+        ids = list(result.scalars().all())
+        if ids:
+            await session.execute(
+                delete(Subscribe).where(col(Subscribe.id).in_(ids)).execution_options(synchronize_session=False)
+            )
+        return len(ids)
 
     @classmethod
     @with_read_session

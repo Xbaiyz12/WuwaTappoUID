@@ -66,8 +66,14 @@ def render_statistics(
     top: list[tuple[str, str, int]],
     coverage: str,
 ) -> bytes:
-    missing_height = 28 if stats.missing else 0
-    rank_top = 584 + missing_height
+    detail_notes = []
+    if stats.missing:
+        detail_notes.append(f"缺少物品详情 {stats.missing} 次。")
+    if stats.invalid:
+        detail_notes.append(f"物品详情异常 {stats.invalid} 次，请主人检查原始流水。")
+    if detail_notes:
+        detail_notes.append(f"占比、消耗及排名仅统计详情有效的 {stats.known} 次。")
+    rank_top = 584 + len(detail_notes) * 24
     rank_bottom = rank_top + 70 + max(1, len(top)) * 50
     note_top = rank_bottom + 18
     footer_top = note_top + 27
@@ -92,9 +98,8 @@ def render_statistics(
     draw.line((s(424), s(483), s(830), s(483)), fill=BORDER, width=s(1))
     draw_text(draw, 432, 497, 30, "累计消耗点击", 19, BROWN)
     draw_text(draw, 824, 492, 38, f"{stats.clicks:,}", 25, BROWN, align="right")
-    if stats.missing:
-        message = f"另有 {stats.missing} 次成功开箱缺少物品详情，占比、消耗及排名仅统计其余 {stats.known} 次。"
-        draw_text(draw, WIDTH / 2, 567, 22, message, 13, SOFT, align="center")
+    for index, message in enumerate(detail_notes):
+        draw_text(draw, WIDTH / 2, 567 + index * 24, 22, message, 13, SOFT, align="center")
 
     panel(draw, rank_top, rank_bottom)
     draw.rounded_rectangle((s(42), s(rank_top + 6), s(858), s(rank_top + 48)), s(18), fill=(233, 237, 211))

@@ -1,24 +1,32 @@
 """分批归档与清理；累计入账和删除原始流水始终在同一写事务内。"""
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from gsuid_core.utils.database.base_models import with_session
-from gsuid_core.utils.database.models import Subscribe
 from sqlalchemy import and_, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from sqlmodel import col, select
 
-from .database import ChestRecord, ChestSummary, ChestTask, LoginSession, Notice, SynthesisRecord
+from .database import ChestRecord, ChestSummary, ChestTask, Notice, SynthesisRecord
+from .schema import DataError
 from .statistics import CHINA, read_result
 
 BATCH_SIZE = 100
 
 
+@dataclass(frozen=True)
+class ArchiveBatchResult:
+    processed: int
+    archived: int
+    quarantined: tuple[str, ...]
+
+
 class HistoryArchive:
     @classmethod
     @with_session
-    async def archive_batch(cls, session: AsyncSession, cutoff: float, daily_cutoff: float) -> int:
+    async def archive_batch(cls, session: AsyncSession, cutoff: float, daily_cutoff: float) -> ArchiveBatchResult:
         current_run = (
             select(ChestTask.account_id)
             .where(
@@ -49,7 +57,7 @@ class HistoryArchive:
         )
         delivered = (
             select(Notice.id)
-            .where(Notice.id == ChestRecord.notice_id, col(Notice.submitted).is_(True))
+            .where(Notice.id == ChestRecord.notice_id, col(Notice.delivery_state).in_(["submitted", "unroutable"]))
             .correlate(ChestRecord)
             .exists()
         )
@@ -63,16 +71,31 @@ class HistoryArchive:
         )
         result = await session.execute(
             select(ChestRecord)
-            .where(ChestRecord.created_at < cutoff, eligible, or_(~current_run, four_later))
+            .where(
+                ChestRecord.created_at < cutoff,
+                ChestRecord.archive_error == "",
+                eligible,
+                or_(~current_run, four_later),
+            )
             .order_by(col(ChestRecord.created_at), col(ChestRecord.id))
             .limit(BATCH_SIZE)
         )
         records = list(result.scalars().all())
         summaries: dict[tuple[str, int, str, str], ChestSummary] = {}
+        archived = []
+        quarantined = []
         for record in records:
             if record.state != "success":
+                archived.append(record.id)
                 continue
-            item = read_result(record.result) if record.result else None
+            try:
+                item = read_result(record.result) if record.result else None
+            except DataError as error:
+                record.archive_error = str(error)[:160]
+                session.add(record)
+                quarantined.append(record.id)
+                continue
+            archived.append(record.id)
             asset_id = str(item.asset_id) if item is not None else ""
             rarity = str(item.rarity_type) if item is not None else ""
             clicks = item.click_consume if item is not None else 0
@@ -105,13 +128,13 @@ class HistoryArchive:
                 session.add(summary)
         # 写入汇总后再删除这批明细；失败或中断时整个事务回滚。
         await session.flush()
-        if records:
+        if archived:
             await session.execute(
                 delete(ChestRecord)
-                .where(col(ChestRecord.id).in_([record.id for record in records]))
+                .where(col(ChestRecord.id).in_(archived))
                 .execution_options(synchronize_session=False)
             )
-        return len(records)
+        return ArchiveBatchResult(len(records), len(archived), tuple(quarantined))
 
     @classmethod
     @with_session
@@ -119,8 +142,10 @@ class HistoryArchive:
         referenced = select(ChestRecord.id).where(ChestRecord.notice_id == Notice.id).correlate(Notice).exists()
         result = await session.execute(
             select(Notice)
-            .where(col(Notice.submitted).is_(True), Notice.submitted_at < cutoff, ~referenced)
-            .order_by(col(Notice.submitted_at), col(Notice.id))
+            .where(
+                col(Notice.delivery_state).in_(["submitted", "unroutable"]), Notice.finished_at < cutoff, ~referenced
+            )
+            .order_by(col(Notice.finished_at), col(Notice.id))
             .limit(BATCH_SIZE)
         )
         notices = list(result.scalars().all())
@@ -144,18 +169,4 @@ class HistoryArchive:
         daily = list(result.scalars().all())
         for summary in daily:
             await session.delete(summary)
-        await session.flush()
-        # 仅回收这批已完成通知遗留的本插件路由，不触碰新建中或仍被引用的订阅。
-        for subscription_id in {notice.subscription_id for notice in notices}:
-            sub = await session.get(Subscribe, subscription_id)
-            if sub is None or sub.task_name != "WuwaTappo宝箱":
-                continue
-            references = or_(
-                *(
-                    select(model.subscription_id).where(model.subscription_id == subscription_id).exists()
-                    for model in (ChestTask, ChestRecord, Notice, LoginSession)
-                )
-            )
-            if not await session.scalar(select(references)):
-                await session.delete(sub)
         return len(notices) + len(synthesis) + len(daily)

@@ -55,26 +55,31 @@ class StatisticsPeriod:
 class ChestStatistics:
     total: int
     missing: int
+    invalid: int
     counts: dict[str, int]
     clicks: int
     top: list[tuple[OpenResult, int]]
 
     @property
     def known(self) -> int:
-        return self.total - self.missing
+        return self.total - self.missing - self.invalid
 
     @classmethod
     def aggregate(cls, groups: list[tuple[str, int, int | None]]) -> "ChestStatistics":
         counts = dict.fromkeys(RARITIES, 0)
         quantities: Counter[str] = Counter()
         items: dict[str, OpenResult] = {}
-        total = missing = clicks = 0
+        total = missing = invalid = clicks = 0
         for payload, count, consumed in groups:
             total += count
             if not payload:
                 missing += count
                 continue
-            result = read_result(payload)
+            try:
+                result = read_result(payload)
+            except DataError:
+                invalid += count
+                continue
             rarity = str(result.rarity_type)
             counts[rarity] += count
             clicks += result.click_consume * count if consumed is None else consumed
@@ -82,4 +87,4 @@ class ChestStatistics:
             quantities[key] += count
             items[key] = result
         top = [(items[key], count) for key, count in quantities.most_common(5)]
-        return cls(total, missing, counts, clicks, top)
+        return cls(total, missing, invalid, counts, clicks, top)

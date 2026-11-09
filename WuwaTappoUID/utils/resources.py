@@ -3,8 +3,10 @@
 import asyncio
 import hashlib
 import re
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar
+from typing import ParamSpec, TypeVar
 
 from gsuid_core.logger import logger
 from pydantic import BaseModel, ValidationError
@@ -26,6 +28,8 @@ from .settings import retry_limit
 
 DEFAULT_HOST = "https://mc-wuwatappo.kurogames-global.com"
 CacheModel = TypeVar("CacheModel", bound=BaseModel)
+DiskResult = TypeVar("DiskResult")
+DiskArgs = ParamSpec("DiskArgs")
 
 
 class Activity(BaseModel):
@@ -74,7 +78,8 @@ class Resources:
         self._update: asyncio.Task[str] | None = None
         self._update_force = False
         self._needs_retry = True
-        self._image_locks: dict[str, asyncio.Lock] = {}
+        self.raw_cache_lock = asyncio.Lock()
+        self.image_cache_lock = asyncio.Lock()
 
     @property
     def assets_host(self) -> str:
@@ -96,7 +101,7 @@ class Resources:
         if not path.exists():
             return None
         try:
-            return await asyncio.to_thread(self._read_cache, path, model)
+            return await self.disk(self._read_cache, path, model)
         except (OSError, ValidationError):
             logger.warning(f"[WuwaTappoUID] 缓存 {path.name} 无法读取，将在更新资源时重建。")
             return None
@@ -122,6 +127,48 @@ class Resources:
             self._update.cancel()
             await asyncio.gather(self._update, return_exceptions=True)
 
+    @staticmethod
+    async def disk(
+        operation: Callable[DiskArgs, DiskResult], *args: DiskArgs.args, **kwargs: DiskArgs.kwargs
+    ) -> DiskResult:
+        worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                await worker
+            finally:
+                raise
+
+    @staticmethod
+    def prune_files(directory: Path, *, keep: set[str] | None = None, limit: int = 128 * 1024 * 1024) -> None:
+        if not directory.exists():
+            return
+        files = []
+        cutoff = time.time() - 7 * 86400
+        for path in directory.iterdir():
+            if not path.is_file() or re.fullmatch(r"[0-9a-f]{64}\.png", path.name) is None:
+                continue
+            stat = path.stat()
+            if keep is not None:
+                if path.name not in keep:
+                    path.unlink()
+            elif stat.st_mtime < cutoff:
+                path.unlink()
+            else:
+                files.append((stat.st_mtime, stat.st_size, path))
+        if keep is None:
+            size = sum(entry[1] for entry in files)
+            for _, length, path in sorted(files):
+                if size <= limit:
+                    break
+                path.unlink()
+                size -= length
+
+    async def prune_generated(self) -> None:
+        async with self.image_cache_lock:
+            await self.disk(self.prune_files, self.image_dir)
+
     async def _json_file(self, url: str, path: Path, force: bool) -> Download:
         headers = self.state.headers.get(url, CacheHeaders())
         use_cache = not force and path.exists() and self.state.sources.get(path.name) == url
@@ -131,12 +178,12 @@ class Resources:
             last_modified=headers.last_modified if use_cache else "",
         )
         if response.not_modified:
-            response.body = await asyncio.to_thread(path.read_bytes)
+            response.body = await self.disk(path.read_bytes)
         return response
 
     async def _commit_json(self, url: str, path: Path, response: Download) -> None:
         if not response.not_modified:
-            await asyncio.to_thread(self._write_file, path, response.body)
+            await self.disk(self._write_file, path, response.body)
         self.state.headers[url] = CacheHeaders(etag=response.etag, last_modified=response.last_modified)
         self.state.sources[path.name] = url
 
@@ -211,7 +258,7 @@ class Resources:
                 if not items:
                     raise DataError("远端图鉴为空，保留原图鉴目录。")
                 catalog = Catalog(items=items)
-                await asyncio.to_thread(self._write_file, self.catalog_path, catalog.model_dump_json().encode())
+                await self.disk(self._write_file, self.catalog_path, catalog.model_dump_json().encode())
                 self.catalog = catalog
                 messages.append(f"图鉴目录已同步（{len(items)} 项）。")
             except MaintenanceError:
@@ -222,10 +269,18 @@ class Resources:
             messages.append(f"物品图：下载 {updated}，跳过 {skipped}，失败 {failed}，待补齐 {deferred}。")
             if failed or deferred:
                 problems.append("部分图片下载失败，后续普通更新会继续补齐。")
+        if not problems:
+            active_urls = set(self.state.sources.values())
+            self.state.headers = {url: headers for url, headers in self.state.headers.items() if url in active_urls}
         try:
-            await asyncio.to_thread(self._write_file, self.state_path, self.state.model_dump_json().encode())
+            await self.disk(self._write_file, self.state_path, self.state.model_dump_json().encode())
         except OSError:
             problems.append("资源索引写入失败，下次更新将重新核对。")
+        if not problems and self.manifest is not None:
+            urls = (*self.manifest.images().values(), *self.manifest.head_images().values())
+            keep = {self._raw_path(self._image_url(relative)).name for relative in urls}
+            async with self.raw_cache_lock:
+                await self.disk(self.prune_files, self.raw_dir, keep=keep)
         self._needs_retry = bool(problems)
         self.revision += 1
         mode = "强制资源更新" if force else "资源增量更新"
@@ -266,8 +321,9 @@ class Resources:
                     if consecutive_failures >= retry_limit():
                         return "deferred"
                     raw = await self.api.fetch_bytes(url)
-                    await asyncio.to_thread(self._verify_image, raw)
-                    await asyncio.to_thread(self._write_file, path, raw)
+                    await self.disk(self._verify_image, raw)
+                    async with self.raw_cache_lock:
+                        await self.disk(self._write_file, path, raw)
                     consecutive_failures = 0
                     return "updated"
                 except (WuwaError, OSError, ValueError) as error:
@@ -332,17 +388,21 @@ class Resources:
         return entry
 
     async def character_head(self, character: DesktopCharacter) -> bytes:
+        async with self.raw_cache_lock:
+            return await self._character_head(character)
+
+    async def _character_head(self, character: DesktopCharacter) -> bytes:
         """只读本地头像；缺少 head1 时复用按 ID 或素材文件名匹配的本地主图。"""
         entry = self._character_entry(character)
         images = ([entry.head1.url] if entry.head1 is not None else []) + [entry.url]
         for relative in images:
             path = self._raw_path(self._image_url(relative))
             if path.exists():
-                raw = await asyncio.to_thread(path.read_bytes)
+                raw = await self.disk(path.read_bytes)
                 try:
-                    await asyncio.to_thread(self._verify_image, raw)
+                    await self.disk(self._verify_image, raw)
                 except DataError:
-                    await asyncio.to_thread(path.unlink)
+                    await self.disk(path.unlink)
                     logger.warning("[WuwaTappoUID] 本地头像缓存损坏，资源更新时重新下载。")
                 else:
                     return raw
@@ -350,25 +410,28 @@ class Resources:
 
     async def item_image(self, asset_id: str | int, rarity: str) -> bytes | None:
         """只读本地原图，推送过程不等待网络下载。"""
-        if self.manifest is None:
-            return None
-        relative = self.manifest.lookup(str(asset_id))
-        if not relative:
-            return None
-        path = self._raw_path(self._image_url(relative))
-        if not path.exists():
-            return None
         try:
-            raw = await asyncio.to_thread(path.read_bytes)
+            async with self.raw_cache_lock:
+                if self.manifest is None:
+                    return None
+                relative = self.manifest.lookup(str(asset_id))
+                if not relative:
+                    return None
+                path = self._raw_path(self._image_url(relative))
+                if not path.exists():
+                    return None
+                raw = await self.disk(path.read_bytes)
             # 内容参与缓存键，强制覆盖同一个 URL 后也会重新绘制通知图。
             config = RenderConfig.capture()
             key = hashlib.sha256(raw + rarity.encode() + b"footer-v1" + config.bot_name.encode()).hexdigest()
             cached = self.image_dir / f"{key}.png"
-            async with self._image_locks.setdefault(key, asyncio.Lock()):
+            async with self.image_cache_lock:
                 if cached.exists():
-                    return await asyncio.to_thread(cached.read_bytes)
+                    tile = await self.disk(cached.read_bytes)
+                    await self.disk(cached.touch)
+                    return tile
                 tile = await render_in_thread(render_tile, raw, rarity, config=config)
-                await asyncio.to_thread(self._write_file, cached, tile)
+                await self.disk(self._write_file, cached, tile)
                 return tile
         except (OSError, ValueError):
             logger.warning("[WuwaTappoUID] 本地物品图无法读取或绘制，本条只发文字；可强制更新资源修复。")

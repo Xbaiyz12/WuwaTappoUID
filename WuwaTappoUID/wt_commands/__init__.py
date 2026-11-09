@@ -16,6 +16,7 @@ from ..runtime import login, resources, service
 from ..utils.api import with_read_cache
 from ..utils.backpack import BagFilter
 from ..utils.help_card import help_text, render_bytes
+from ..utils.lifecycle import tracked
 from ..utils.render_cache import HelpImageCache
 from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
 from ..utils.statistics import StatisticsPeriod
@@ -57,8 +58,16 @@ COMMANDS = (
 
 
 @sv.on_command((*COMMANDS, "帮助"), block=True)
-@with_read_cache
 async def wt_command(bot: Bot, event: Event) -> None:
+    try:
+        await execute_command(bot, event)
+    except WuwaError as error:
+        await bot.send(str(error))
+
+
+@tracked(lambda: service.runtime)
+@with_read_cache
+async def execute_command(bot: Bot, event: Event) -> None:
     # GS 会把命令本身放在 command，把剥离命令后的参数放在 text。
     command = event.command.removeprefix("wt").strip()
     argument = event.text.strip()
@@ -136,7 +145,7 @@ async def wt_command(bot: Bot, event: Event) -> None:
         elif command == "宝箱":
             replies = await service.start_or_renew(event)
         elif command == "暂停":
-            replies = [await service.set_paused(event, True)]
+            replies = [await service.pause(event)]
         elif command == "恢复":
             replies = [await service.recover(event)]
         elif command == "停止":

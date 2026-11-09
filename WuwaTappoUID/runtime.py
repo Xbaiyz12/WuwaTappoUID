@@ -9,12 +9,15 @@ from gsuid_core.gss import gss
 from gsuid_core.logger import logger
 from gsuid_core.server import on_core_shutdown, on_core_start, on_core_start_before
 from gsuid_core.shutdown import shutdown_event
+from gsuid_core.utils.database.base_models import DatabaseWriteTimeout
+from gsuid_core.utils.database.write_gate import WriteGateTimeout
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from .utils.api import WuwaAPI, with_read_cache
 from .utils.database import Account, AccountLink, Binding, Store, ensure_database_schema
 from .utils.failures import ALERT_JOB
+from .utils.lifecycle import RuntimeOwner
 from .utils.login import LoginManager
 from .utils.resources import Resources
 from .utils.schema import DatabaseSchemaError, DataError, MaintenanceError, SessionImport, WuwaError, token_expiry
@@ -26,7 +29,9 @@ api = WuwaAPI()
 resources = Resources(api, ROOT)
 service = Service(api, resources)
 login = LoginManager(service)
+owner = RuntimeOwner(service, api, resources, login)
 NOTICE_JOB = "WuwaTappoUID:notice"
+MAINTAIN_JOB = "WuwaTappoUID:maintain"
 RESOURCE_JOB = "WuwaTappoUID:resources"
 LOGIN_JOB = "WuwaTappoUID:login"
 LOCAL_LOGIN_JOB = "WuwaTappoUID:login-local"
@@ -76,8 +81,9 @@ async def import_sessions() -> None:
             Binding(id=owner, platform=entry.platform, user_id=entry.user_id, account_id=account.id),
             AccountLink(owner_id=owner, account_id=account.id),
         )
+        if old_account is not None and old_account.token != account.token:
+            api.retire_token(old_account.token)
         await service.failures.reset_account(account.id)
-        await Store.reset_notice_attempts(account.id)
     # 成功后移除明文导入文件；token 只保存在 GS 数据库中。
     await asyncio.to_thread(path.unlink)
     logger.info(f"[WuwaTappoUID] 已导入 {len(entries)} 个登录态，导入文件已移除。")
@@ -85,6 +91,10 @@ async def import_sessions() -> None:
 
 @on_core_start_before(priority=0)
 async def wt_initialize() -> None:
+    await owner.activate()
+
+
+async def initialize() -> None:
     global _initialize_attempted
     async with _initialize_lock:
         if _initialize_attempted:
@@ -94,7 +104,7 @@ async def wt_initialize() -> None:
             await service.failures.load()
             logger.info(f"[WuwaTappoUID] 已加载待发送告警，后台连续异常上限 {retry_limit()} 次（本次运行计数）。")
             await ensure_database_schema()
-            await Store.prepare_login_sessions(startup=True)
+            await login.maintain_sessions(startup=True)
             await api.start()
             await resources.load()
         except (SQLAlchemyError, DatabaseSchemaError) as error:
@@ -113,7 +123,7 @@ async def wt_initialize() -> None:
             await import_sessions()
         except SQLAlchemyError as error:
             await service.disable_database(error)
-        except (WuwaError, OSError) as error:
+        except (WuwaError, OSError, DatabaseWriteTimeout, WriteGateTimeout) as error:
             detail = service.error_detail(error)
             logger.error(f"[WuwaTappoUID] 登录态导入失败，文件已保留，已有账号与任务继续运行：{detail}")
             await service.failures.fail("import", "登录态导入", detail, limit=1)
@@ -148,13 +158,9 @@ async def wt_update_resources() -> None:
             return
 
 
-@on_core_start
-async def wt_start() -> None:
-    # GS 捕获启动前异常后仍会执行启动后钩子；若初始化被跳过，在这里补做一次。
-    await wt_initialize()
-    # 告警投递独立于插件数据库，数据库被停用后仍能通知 GS 主人。
+async def start_jobs() -> None:
     scheduler.add_job(
-        service.failures.flush_alerts,
+        owner.entry(service.failures.flush_alerts),
         "interval",
         seconds=60,
         id=ALERT_JOB,
@@ -166,64 +172,62 @@ async def wt_start() -> None:
     if not service.database_ready:
         logger.error("[WuwaTappoUID] 初始化未完成，不恢复宝箱任务；请检查首次启动异常。")
         return
-    try:
-        await service.restore()
-    except SQLAlchemyError as error:
-        await service.disable_database(error)
-        return
-    scheduler.add_job(
-        service.maintain,
-        "interval",
-        seconds=60,
-        id=NOTICE_JOB,
-        name="WuwaTappo 待发通知与任务巡检",
-        replace_existing=True,
+    jobs = (
+        (MAINTAIN_JOB, maintain, 60, "WuwaTappo 任务巡检"),
+        (NOTICE_JOB, service.flush_notices, 60, "WuwaTappo 结果通知"),
+        (HISTORY_JOB, service.archive_history, 60, "WuwaTappo 历史归档与清理"),
+        (LOCAL_LOGIN_JOB, login.poll_local, 1, "WuwaTappo 本地登录与结果补写"),
+        (LOGIN_JOB, login.poll_external, 3, "WuwaTappo 外置登录结果"),
     )
+    for job_id, operation, seconds, name in jobs:
+        scheduler.add_job(
+            owner.entry(operation),
+            "interval",
+            seconds=seconds,
+            id=job_id,
+            name=name,
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     scheduler.add_job(
-        service.archive_history,
-        "interval",
-        seconds=60,
-        id=HISTORY_JOB,
-        name="WuwaTappo 历史归档与清理",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        login.poll_local,
-        "interval",
-        seconds=1,
-        id=LOCAL_LOGIN_JOB,
-        name="WuwaTappo 本地登录提交",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        login.poll_external,
-        "interval",
-        seconds=3,
-        id=LOGIN_JOB,
-        name="WuwaTappo 外置登录结果",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        wt_update_resources,
+        owner.entry(wt_update_resources, cancellable=True),
         "date",
         id=RESOURCE_JOB,
         name="WuwaTappo 名称与图库增量更新",
         replace_existing=True,
         misfire_grace_time=None,
     )
+    try:
+        await service.restore()
+    except SQLAlchemyError as error:
+        await service.disable_database(error)
+    except (DatabaseWriteTimeout, WriteGateTimeout) as error:
+        await service.failures.fail("restore", "任务恢复", service.error_detail(error), limit=1)
+
+
+async def maintain() -> None:
+    if service.closing or not service.database_ready:
+        return
+    await login.maintain_sessions()
+    await service.maintain()
+
+
+owner.initialize = initialize
+owner.start_jobs = start_jobs
+
+
+@on_core_start
+async def wt_start() -> None:
+    await owner.activate(start=True)
 
 
 @gss.on_bot_connect
 @with_read_cache
 async def wt_bot_connected() -> None:
-    service.failures.wake_alerts()
-    await service.flush_notices()
+    if owner.active:
+        service.failures.wake_alerts()
+        service.wake_notices()
 
 
 @on_core_shutdown(priority=-10)
@@ -232,9 +236,4 @@ async def wt_shutdown() -> None:
     if not shutdown_event.is_set():
         logger.debug("[WuwaTappoUID] 核心尚未实际退出，保留网络会话与后台任务。")
         return
-    service.closing = True
-    for job in scheduler.get_jobs():
-        if job.id.startswith("WuwaTappoUID:"):
-            job.remove()
-    await resources.close()
-    await api.close()
+    await owner.drain()

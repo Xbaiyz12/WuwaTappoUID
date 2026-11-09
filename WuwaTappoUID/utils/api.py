@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
+from itertools import count
 from typing import ParamSpec, TypeVar
 
 import aiohttp
@@ -30,6 +31,7 @@ from .schema import (
     MaintenanceError,
     NetworkError,
     OpenResult,
+    OperationStopped,
     RoleInfo,
     RoleQuery,
     SdkLogin,
@@ -47,6 +49,7 @@ RETRY_DELAYS = (1, 3, 5)
 RESOURCE_TIMEOUT = aiohttp.ClientTimeout(total=25, connect=8, sock_read=12)
 CLICK_INTERVAL = 30
 CLICK_RATE_RETRIES = 3
+_READ_VERSIONS = count(1)
 
 
 @dataclass
@@ -131,6 +134,9 @@ class WuwaAPI:
         self._versions: dict[str, int] = {}
         self._requests: dict[str, AccountRequests] = {}
         self._socket_rooms: dict[str, str] = {}
+        self._token_users: dict[str, int] = {}
+        self._retired_tokens: set[str] = set()
+        self.stopping = False
         self.maintenance = False
         self._maintenance_probe_after = 0.0
         self._maintenance_lock = asyncio.Lock()
@@ -193,11 +199,40 @@ class WuwaAPI:
 
     def _read_key(self, token: str) -> tuple[str, int]:
         key = hashlib.sha256(token.encode()).hexdigest()
-        return key, self._versions.get(key, 0)
+        if key not in self._versions:
+            self._versions[key] = next(_READ_VERSIONS)
+        return key, self._versions[key]
 
     def invalidate(self, token: str) -> None:
-        key, version = self._read_key(token)
-        self._versions[key] = version + 1
+        key = self._read_key(token)[0]
+        self._versions[key] = next(_READ_VERSIONS)
+
+    def retire_token(self, token: str) -> None:
+        if token:
+            key = hashlib.sha256(token.encode()).hexdigest()
+            self._retired_tokens.add(key)
+            self._collect_token(key)
+
+    def _collect_token(self, key: str) -> None:
+        if key in self._retired_tokens and not self._token_users.get(key, 0):
+            self._requests.pop("token:" + key, None)
+            self._socket_rooms.pop(key, None)
+            self._versions.pop(key, None)
+            self._retired_tokens.remove(key)
+
+    @asynccontextmanager
+    async def token_use(self, token: str) -> AsyncIterator[None]:
+        key = hashlib.sha256(token.encode()).hexdigest()
+        self._token_users[key] = self._token_users.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            users = self._token_users[key] - 1
+            if users:
+                self._token_users[key] = users
+            else:
+                del self._token_users[key]
+            self._collect_token(key)
 
     async def start(self) -> None:
         self.session = aiohttp.ClientSession(
@@ -209,6 +244,10 @@ class WuwaAPI:
     async def close(self) -> None:
         if self.session is not None:
             await self.session.close()
+        self._requests.clear()
+        self._socket_rooms.clear()
+        self._versions.clear()
+        self._retired_tokens.clear()
 
     def client(self) -> aiohttp.ClientSession:
         if self.session is None:
@@ -218,10 +257,14 @@ class WuwaAPI:
     async def fetch(
         self, url: str, method: str = "GET", payload: object = None, token: str = "", *, retry: bool = True
     ) -> Envelope:
+        async with self.token_use(token):
+            return await self._fetch(url, method, payload, token, retry=retry)
+
+    async def _fetch(self, url: str, method: str, payload: object, token: str, *, retry: bool) -> Envelope:
         async def request() -> Envelope:
-            cuid = str(payload.get("cuid", "")) if isinstance(payload, dict) else ""
+            cuid = str(payload["cuid"]) if isinstance(payload, dict) and "cuid" in payload else ""
             async with self.account_request(token, cuid):
-                return await self._fetch_once(url, method, payload, token)
+                return await self._fetch_once(url, method, payload, token, write=not retry)
 
         if retry:
             return await retry_network(request, "接口请求")
@@ -231,9 +274,11 @@ class WuwaAPI:
             logger.warning(f"[WuwaTappoUID] 本次接口请求结果未确认：{error.details}。")
             raise
 
-    async def _fetch_once(self, url: str, method: str, payload: object, token: str) -> Envelope:
+    async def _fetch_once(self, url: str, method: str, payload: object, token: str, *, write: bool = False) -> Envelope:
         if url != BASE + "/api/common/activity-config":
             await self.ensure_available()
+        if write and self.stopping:
+            raise OperationStopped
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         path = url.removeprefix(BASE).split("?", 1)[0]
         request_id = ""
@@ -303,11 +348,14 @@ class WuwaAPI:
                     raise DataError(f"资源下载被拒绝（HTTP {response.status}）。")
                 if response.content_length is not None and response.content_length > limit:
                     raise DataError("资源文件过大，已跳过。")
-                # read(n) 可能只返回已到达的首段；read() 才会等完整响应。
-                body = await response.read()
-                if len(body) > limit:
-                    raise DataError("资源文件过大，已跳过。")
-                return Download(body, response.headers.get("ETag", ""), response.headers.get("Last-Modified", ""))
+                body = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if len(body) + len(chunk) > limit:
+                        raise DataError("资源文件过大，已跳过。")
+                    body.extend(chunk)
+                return Download(
+                    bytes(body), response.headers.get("ETag", ""), response.headers.get("Last-Modified", "")
+                )
         except (aiohttp.ClientError, TimeoutError) as error:
             raise NetworkError("资源下载失败或超时。", network_details(url.split("?", 1)[0], error)) from None
 
@@ -363,6 +411,10 @@ class WuwaAPI:
             raise DataError("token 续期接口未返回 true，原会话已保留。")
 
     async def me(self, token: str, *, fresh: bool = False) -> UserInfo:
+        async with self.token_use(token):
+            return await self._me(token, fresh=fresh)
+
+    async def _me(self, token: str, *, fresh: bool) -> UserInfo:
         cache = _read_cache.get()
         key = self._read_key(token)
         if not fresh and cache is not None and cache.active and key in cache.users:
@@ -375,6 +427,10 @@ class WuwaAPI:
         return info
 
     async def bags(self, token: str, *, fresh: bool = False) -> list[Item]:
+        async with self.token_use(token):
+            return await self._bags(token, fresh=fresh)
+
+    async def _bags(self, token: str, *, fresh: bool) -> list[Item]:
         cache = _read_cache.get()
         cache_key = self._read_key(token)
         if not fresh and cache is not None and cache.active and cache_key in cache.bags:
@@ -422,6 +478,10 @@ class WuwaAPI:
         )
 
     async def set_clicks(self, token: str, total: int, expires_at: float | None = None) -> int:
+        async with self.token_use(token):
+            return await self._set_clicks(token, total, expires_at)
+
+    async def _set_clicks(self, token: str, total: int, expires_at: float | None) -> int:
         """重连时仍提交同一个目标累计值；回读已达到目标就不再发送。"""
         await self.ensure_available()
         key = self._read_key(token)[0]
@@ -457,6 +517,8 @@ class WuwaAPI:
 
     async def _set_clicks_once(self, token: str, total: int, expires_at: float | None) -> int:
         await self.ensure_available()
+        if self.stopping:
+            raise OperationStopped
         self.invalidate(token)
         try:
             async with asyncio.timeout(15):
@@ -485,13 +547,15 @@ class WuwaAPI:
                         elif message.startswith("40") and not sent_clicks:
                             if expires_at is not None and time.time() >= expires_at:
                                 raise Expired
+                            if self.stopping:
+                                raise OperationStopped
                             await ws.send_str("421" + json.dumps(["cr", {"num": total}], separators=(",", ":")))
                             sent_clicks = True
                         elif message.startswith("42"):
                             event = JSON.validate_json(message[2:])
                             if isinstance(event, list) and len(event) >= 2 and event[0] == "fd":
                                 body = event[1]
-                                if isinstance(body, dict) and isinstance(body.get("c"), int):
+                                if isinstance(body, dict) and "c" in body and isinstance(body["c"], int):
                                     raise ApiError(body["c"], path="/socket.io:fd")
                         elif message.startswith("43") and sent_clicks:
                             # 部分服务端在 43 后携带 ACK id，正文从 [ 或 { 开始。
@@ -504,7 +568,7 @@ class WuwaAPI:
                             body = JSON.validate_json(message[start:])
                             if isinstance(body, list) and body:
                                 body = body[0]
-                            if not isinstance(body, dict) or not isinstance(body.get("c"), int):
+                            if not isinstance(body, dict) or "c" not in body or not isinstance(body["c"], int):
                                 raise DataError("点击确认帧格式已变化。")
                             code = body["c"]
                             if code in CODE_TOKEN_INVALID:

@@ -5,11 +5,10 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from .database import ChestTask
-from .resources import Resources
-from .schema import SIDE_NAMES, Item, OpenResult, Side, UserInfo
+from .schema import SIDE_NAMES, UserInfo
 
 CHINA = timezone(timedelta(hours=8))
-PAUSE_REASONS = {"manual": "手动暂停", "auth": "登录态失效", "failure": "连续失败"}
+PAUSE_REASONS = {"manual": "手动暂停", "auth": "登录态失效", "failure": "连续失败", "route": "通知路由失效"}
 
 
 def mask_cuid(cuid: str | int) -> str:
@@ -60,43 +59,3 @@ def task_text(task: ChestTask | None) -> str:
         f"自动开箱：{state}\n剩余：{remaining_text(task.remaining(now))}\n"
         f"到期：{deadline}\n本轮成功：{task.successes} 个"
     )
-
-
-def chest_text(side: Side, result: OpenResult, info: UserInfo, resources: Resources, supplement: str) -> str:
-    return (
-        f"{SIDE_NAMES[side]}宝箱开启成功\n"
-        f"物品：{resources.name(result.asset_name, result.asset_id)}\n"
-        f"稀有度：{result.rarity_type}\n"
-        f"消耗点击：{result.click_consume}\n"
-        f"剩余点击：{info.remaining}\n"
-        f"下次可开：{date_text(info.cooldown(side))}" + (f"\n{supplement}" if supplement else "")
-    )
-
-
-def split_lines(lines: list[str], limit: int = 1400) -> list[str]:
-    parts: list[str] = []
-    current = ""
-    for line in lines:
-        if current and len(current) + len(line) + 1 > limit:
-            parts.append(current)
-            current = ""
-        current += ("\n" if current else "") + line
-    if current:
-        parts.append(current)
-    return parts
-
-
-def bag_text(items: list[Item], resources: Resources) -> list[str]:
-    if not items:
-        return ["背包为空。"]
-    groups: dict[str, list[Item]] = {}
-    names = {"character_skin": "角色皮肤", "accessory": "配件", "emote": "表情"}
-    for item in items:
-        groups.setdefault(item.asset_type, []).append(item)
-    lines = [f"背包：共 {len(items)} 项"]
-    for kind, entries in groups.items():
-        lines.append(f"【{names.get(kind, kind)}】")
-        for item in entries:
-            rarity = item.rarity if item.rarity is not None else "未知"
-            lines.append(f"{resources.name(item.asset_name, item.asset_id)} ×{item.quantity}［稀有度：{rarity}］")
-    return split_lines(lines)

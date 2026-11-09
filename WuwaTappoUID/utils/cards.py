@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,8 @@ from .statistics_card import render_statistics
 
 KINDS = {"character": "角色", "accessory": "配件", "emote": "表情"}
 RESULT_PAGE_SIZE = 40
+AVATAR_CACHE_BYTES = 16 * 1024 * 1024
+AVATAR_CACHE_ITEMS = 256
 CATALOG_PATH = Path(__file__).parent.parent / "assets" / "tappo" / "catalog.json"
 
 
@@ -45,11 +48,21 @@ class BundledCatalog(BaseModel):
     roles: dict[str, str]
 
 
+class SenderProfile(BaseModel):
+    nickname: str | None = None
+    avatar: str | None = None
+
+
 @dataclass
 class ResultContext:
     header: Header
     progress: list[Progress] | None
-    owned: set[str] | None = None
+
+
+@dataclass
+class AvatarRequest:
+    lock: asyncio.Lock
+    users: int = 0
 
 
 class Cards:
@@ -63,7 +76,62 @@ class Cards:
         self._catalog_map: dict[str, CatalogEntry] = {}
         self._catalog_types: dict[str, list[CatalogEntry]] = {}
         self._catalog_rarities: dict[tuple[str, str], list[CatalogEntry]] = {}
-        self._avatars: dict[str, tuple[float, bytes]] = {}
+        self._avatars: OrderedDict[str, tuple[float, bytes]] = OrderedDict()
+        self._avatar_bytes = 0
+        self._avatar_lock = asyncio.Lock()
+        self._avatar_requests: dict[str, AvatarRequest] = {}
+        self._cache_cleanup_after = 0.0
+
+    async def prune_caches(self) -> None:
+        if self._cache_cleanup_after > time.time():
+            return
+        async with self._avatar_lock:
+            await self.resources.disk(Resources.prune_files, self.resources.root / "avatars")
+        await self.resources.prune_generated()
+        self._cache_cleanup_after = time.time() + 86400
+
+    def _cache_avatar(self, url: str, face: bytes) -> None:
+        old = self._avatars.pop(url, None)
+        if old is not None:
+            self._avatar_bytes -= len(old[1])
+        if len(face) > AVATAR_CACHE_BYTES:
+            return
+        while self._avatars and (
+            self._avatar_bytes + len(face) > AVATAR_CACHE_BYTES or len(self._avatars) >= AVATAR_CACHE_ITEMS
+        ):
+            _, old = self._avatars.popitem(last=False)
+            self._avatar_bytes -= len(old[1])
+        self._avatars[url] = (time.time() + 3600, face)
+        self._avatar_bytes += len(face)
+
+    async def avatar(self, url: str) -> bytes:
+        request = self._avatar_requests.setdefault(url, AvatarRequest(asyncio.Lock()))
+        request.users += 1
+        try:
+            async with request.lock:
+                return await self._avatar(url)
+        finally:
+            request.users -= 1
+            if not request.users:
+                del self._avatar_requests[url]
+
+    async def _avatar(self, url: str) -> bytes:
+        cached = self._avatars.get(url)
+        if cached is not None and cached[0] > time.time():
+            self._avatars.move_to_end(url)
+            return cached[1]
+        path = self.resources.root / "avatars" / (hashlib.sha256(url.encode()).hexdigest() + ".png")
+        async with self._avatar_lock:
+            if path.exists() and path.stat().st_mtime > time.time() - 3600:
+                face = await self.resources.disk(path.read_bytes)
+                await self.resources.disk(path.touch)
+                self._cache_avatar(url, face)
+                return face
+        face = await self.api.fetch_bytes(url)
+        async with self._avatar_lock:
+            await self.resources.disk(self.resources._write_file, path, face)
+        self._cache_avatar(url, face)
+        return face
 
     def _refresh_catalog(self) -> None:
         live = self.resources.catalog
@@ -127,6 +195,12 @@ class Cards:
         return entry.name if entry is not None and entry.name else self.resources.name(raw, asset_id)
 
     async def item_cards(self, items: list[Item], *, lazy: bool = False) -> list[Card]:
+        if lazy:
+            return await self._item_cards(items, lazy=True)
+        async with self.resources.raw_cache_lock:
+            return await self._item_cards(items, lazy=False)
+
+    async def _item_cards(self, items: list[Item], *, lazy: bool) -> list[Card]:
         catalog = self.catalog
         manifest = self.resources.manifest
         paths: dict[str, Path] = {}
@@ -147,7 +221,7 @@ class Cards:
                 card.image = LocalImage(path, self.resources.revision) if path is not None else None
             return cards
         # 一批图片只进入一次线程池；同批重复物品共用一次文件读取。
-        images = await asyncio.to_thread(self._read_images, paths) if paths else {}
+        images = await self.resources.disk(self._read_images, paths) if paths else {}
         for item, card in zip(items, cards, strict=True):
             key = str(item.asset_id)
             card.image = images[key] if key in images else None
@@ -156,9 +230,9 @@ class Cards:
     async def header(self, account: Account, available: int | None, event: Event) -> Header:
         # 与原项目一致：昵称和头像属于消息发送者；UID 属于绑定的鸣潮角色。
         cached_name, cached_avatar = await Store.sender_profile(event)
-        sender = event.sender or {}
-        nickname = sender.get("nickname") or cached_name or "漂泊者"
-        avatar_url = sender.get("avatar") or cached_avatar
+        sender = SenderProfile.model_validate(event.sender or {})
+        nickname = sender.nickname or cached_name or "漂泊者"
+        avatar_url = sender.avatar or cached_avatar
         if not avatar_url.startswith(("http://", "https://")):
             if event.bot_id == "onebot":
                 avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={event.user_id}&s=640"
@@ -168,23 +242,11 @@ class Cards:
                 avatar_url = ""
         face = None
         if avatar_url:
-            cached = self._avatars.get(avatar_url)
-            if cached is not None and cached[0] > time.time():
-                face = cached[1]
-            else:
-                try:
-                    async with asyncio.timeout(12):
-                        path = (
-                            self.resources.root / "avatars" / (hashlib.sha256(avatar_url.encode()).hexdigest() + ".png")
-                        )
-                        if path.exists() and path.stat().st_mtime > time.time() - 3600:
-                            face = await asyncio.to_thread(path.read_bytes)
-                        else:
-                            face = await self.api.fetch_bytes(avatar_url)
-                            await asyncio.to_thread(self.resources._write_file, path, face)
-                        self._avatars[avatar_url] = (time.time() + 3600, face)
-                except (WuwaError, TimeoutError, OSError) as error:
-                    logger.warning(f"[WuwaTappoUID] 聊天头像暂不可用：{type(error).__name__}")
+            try:
+                async with asyncio.timeout(12):
+                    face = await self.avatar(avatar_url)
+            except (WuwaError, TimeoutError, OSError) as error:
+                logger.warning(f"[WuwaTappoUID] 聊天头像暂不可用：{type(error).__name__}")
         info = UserInfo.model_validate_json(account.info) if account.info else None
         uid = str(info.player_id) if info and info.player_id else ""
         return Header(nickname=nickname, uid=uid if uid != "0" else "", available=available, avatar=face)
@@ -273,20 +335,6 @@ class Cards:
         snapshot = self.task_snapshot(task, account.subscribed)
         profile = await self.header(account, None, event)
         return await render_in_thread(render_task, profile, snapshot)
-
-    async def result_context(self, account: Account, event: Event) -> ResultContext:
-        progress = None
-        owned = None
-        if account.token_state == "expired":
-            return ResultContext(await self.header(account, None, event), progress)
-        try:
-            async with asyncio.timeout(12):
-                items = await self.api.bags(account.token)
-                progress = self.progress(items)
-                owned = {str(item.asset_id) for item in items if item.quantity > 0}
-        except (WuwaError, TimeoutError) as error:
-            logger.warning(f"[WuwaTappoUID] 本次汇总图无法刷新收集进度：{type(error).__name__}")
-        return ResultContext(await self.header(account, None, event), progress, owned)
 
     async def results(
         self, records: list[ChestRecord], available: int | None, note: str, context: ResultContext
@@ -378,36 +426,40 @@ class Cards:
             groups = {kind: entries for kind, entries in groups.items() if entries}
         images = []
         for kind, entries in groups.items():
-            cards = [
-                AtlasItem(card.name, card.rarity, card.image, item.quantity)
-                for item, card in zip(entries, await self.item_cards(entries, lazy=True), strict=True)
-            ]
-            cards.sort(
-                key=lambda card: (ATLAS_RARITIES.index(card.rarity) if card.rarity in ATLAS_RARITIES else 4, card.name)
-            )
-            rarity_groups = [
-                AtlasGroup(
-                    rarity,
-                    selection,
-                    len(selection),
-                    len(self.catalog_group(kind, rarity)),
+            async with self.resources.raw_cache_lock:
+                cards = [
+                    AtlasItem(card.name, card.rarity, card.image, item.quantity)
+                    for item, card in zip(entries, await self.item_cards(entries, lazy=True), strict=True)
+                ]
+                cards.sort(
+                    key=lambda card: (
+                        ATLAS_RARITIES.index(card.rarity) if card.rarity in ATLAS_RARITIES else 4,
+                        card.name,
+                    )
                 )
-                for rarity in ATLAS_RARITIES
-                if (selection := [card for card in cards if card.rarity == rarity])
-            ]
-            duplicates = sum(card.quantity - 1 for card in cards)
-            note = f"共 {len(cards)} 项    重复 {duplicates} 项"
-            if filters.description:
-                note = f"筛选：{filters.description}    {note}"
-            images.append(
-                await self.draw_atlas(
-                    header,
-                    f"背包 · {KINDS.get(kind, kind or '其他')}",
-                    rarity_groups,
-                    progress,
-                    note,
+                rarity_groups = [
+                    AtlasGroup(
+                        rarity,
+                        selection,
+                        len(selection),
+                        len(self.catalog_group(kind, rarity)),
+                    )
+                    for rarity in ATLAS_RARITIES
+                    if (selection := [card for card in cards if card.rarity == rarity])
+                ]
+                duplicates = sum(card.quantity - 1 for card in cards)
+                note = f"共 {len(cards)} 项    重复 {duplicates} 项"
+                if filters.description:
+                    note = f"筛选：{filters.description}    {note}"
+                images.append(
+                    await self.draw_atlas(
+                        header,
+                        f"背包 · {KINDS.get(kind, kind or '其他')}",
+                        rarity_groups,
+                        progress,
+                        note,
+                    )
                 )
-            )
         return images
 
     async def redeemed(self, account: Account, items: list[Item], event: Event) -> list[bytes]:
@@ -454,20 +506,21 @@ class Cards:
     async def atlas_kind(
         self, header: Header, quantities: dict[str, int], progress: list[Progress], kind: str
     ) -> bytes:
-        entries = self.catalog_group(kind)
-        loaded = await self.item_cards(
-            [Item(asset_id=entry.asset, asset_type=kind, rarity=entry.rarity) for entry in entries], lazy=True
-        )
-        groups = []
-        for rarity in ATLAS_RARITIES:
-            cards = [
-                AtlasItem(card.name, rarity, card.image, quantities.get(str(entry.asset), 0))
-                for entry, card in zip(entries, loaded, strict=True)
-                if card.rarity == rarity
-            ]
-            if cards:
-                groups.append(AtlasGroup(rarity, cards, sum(card.quantity > 0 for card in cards), len(cards)))
-        return await self.draw_atlas(header, f"图鉴 · {KINDS[kind]}", groups, progress)
+        async with self.resources.raw_cache_lock:
+            entries = self.catalog_group(kind)
+            loaded = await self.item_cards(
+                [Item(asset_id=entry.asset, asset_type=kind, rarity=entry.rarity) for entry in entries], lazy=True
+            )
+            groups = []
+            for rarity in ATLAS_RARITIES:
+                cards = [
+                    AtlasItem(card.name, rarity, card.image, quantities.get(str(entry.asset), 0))
+                    for entry, card in zip(entries, loaded, strict=True)
+                    if card.rarity == rarity
+                ]
+                if cards:
+                    groups.append(AtlasGroup(rarity, cards, sum(card.quantity > 0 for card in cards), len(cards)))
+            return await self.draw_atlas(header, f"图鉴 · {KINDS[kind]}", groups, progress)
 
     async def synthesis(
         self,

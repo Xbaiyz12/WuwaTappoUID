@@ -26,6 +26,13 @@ class WuwaError(Exception):
     """可向用户展示的中文错误，不携带 token、URL 查询串或原始响应。"""
 
 
+class OperationStopped(WuwaError):
+    """实例交接已开始，本次修改请求尚未发送。"""
+
+    def __init__(self) -> None:
+        super().__init__("插件正在重新加载，本次修改请求未发送，请稍后重试。")
+
+
 class ApiError(WuwaError):
     def __init__(self, code: int | None, *, http_status: int | None = None, path: str = "", request_id: str = ""):
         self.code = code

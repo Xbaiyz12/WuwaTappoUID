@@ -4,7 +4,7 @@ import hashlib
 import io
 import math
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 from gsuid_core.utils.fonts.fonts import core_font
@@ -79,7 +79,7 @@ def missing_shape(size: int) -> tuple[tuple[int, int], bytes]:
     return mask.size, bytes(mask)
 
 
-@cache
+@lru_cache(maxsize=8192)
 def has_glyph(size: int, char: str) -> bool:
     font = tappo(size)
     if font is None:
