@@ -65,9 +65,13 @@ class RuntimeSlot:
         self.transfer: dict[str, JsonValue] = {}
 
 
-if "wuwatappouid_runtime" not in app.extra:
-    app.extra["wuwatappouid_runtime"] = RuntimeSlot()
-slot = app.extra["wuwatappouid_runtime"]
+if not hasattr(app.state, "wuwatappouid_runtime"):
+    # 接管 0.1.51 已在同一进程中创建的运行实例。
+    if hasattr(app, "extra") and "wuwatappouid_runtime" in app.extra:
+        app.state.wuwatappouid_runtime = app.extra["wuwatappouid_runtime"]
+    else:
+        app.state.wuwatappouid_runtime = RuntimeSlot()
+slot = app.state.wuwatappouid_runtime
 if not isinstance(slot, SlotHandle):
     raise RuntimeError("WT 生命周期槽格式不正确，请完整重启 GsCore。")
 

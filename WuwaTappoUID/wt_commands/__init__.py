@@ -1,13 +1,15 @@
 """wt 命令；显式请求才执行，不注册 AI 工具。"""
 
 import re
+from copy import deepcopy
 
 from gsuid_core.bot import Bot
+from gsuid_core.config import core_config, plugin_config_store
 from gsuid_core.help.utils import register_help
 from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.segment import MessageSegment
-from gsuid_core.sv import SV, get_plugin_available_prefix
+from gsuid_core.sv import SV, config_sv, get_plugin_available_prefix
 from gsuid_core.utils.database.base_models import DatabaseWriteTimeout
 from gsuid_core.utils.database.write_gate import WriteGateTimeout
 from sqlalchemy.exc import SQLAlchemyError
@@ -21,48 +23,63 @@ from ..utils.render_cache import HelpImageCache
 from ..utils.schema import ApiError, AuthenticationError, DataError, NetworkError, WuwaError
 from ..utils.statistics import StatisticsPeriod
 
-sv = SV("WuwaTappo账号与宝箱", pm=6)
-register_help("WuwaTappoUID", f"{get_plugin_available_prefix('WuwaTappoUID')}帮助")
-
-_help_images = HelpImageCache()
-
 
 async def help_image() -> bytes:
     return await _help_images.get(get_plugin_available_prefix("WuwaTappoUID"), render_bytes)
 
 
-COMMANDS = (
-    "添加token",
-    "登录",
-    "查看",
-    "删除",
-    "切换",
-    "订阅",
-    "取消订阅",
-    "信息",
-    "背包",
-    "图鉴",
-    "合成",
-    "兑换",
-    "开箱统计",
-    "增加次数",
-    "次数",
-    "宝箱",
-    "暂停",
-    "恢复",
-    "停止",
-    "状态",
-    "强制更新资源",
-    "更新资源",
+SERVICE_COMMANDS = (
+    ("WuwaTappo登录", 6, ("登录", "添加token")),
+    ("WuwaTappo账号", 6, ("查看", "切换", "信息")),
+    ("WuwaTappo账号删除", 6, ("删除",)),
+    ("WuwaTappo背包", 6, ("背包",)),
+    ("WuwaTappo图鉴", 6, ("图鉴",)),
+    ("WuwaTappo合成", 6, ("合成",)),
+    ("WuwaTappo兑换", 6, ("兑换",)),
+    ("WuwaTappo次数", 6, ("次数", "增加次数")),
+    ("WuwaTappo宝箱任务", 6, ("宝箱", "暂停", "恢复", "停止")),
+    ("WuwaTappo开箱统计", 6, ("开箱统计",)),
+    ("WuwaTappo通知订阅", 6, ("订阅", "取消订阅")),
+    ("WuwaTappo资源更新", 6, ("更新资源",)),
+    ("WuwaTappo强制资源更新", 1, ("强制更新资源",)),
+    ("WuwaTappo状态", 1, ("状态",)),
+    ("WuwaTappo帮助", 6, ("帮助",)),
 )
 
 
-@sv.on_command((*COMMANDS, "帮助"), block=True)
+def migrate_service_config() -> None:
+    old_name = "WuwaTappo账号与宝箱"
+    plugin_configs = plugin_config_store.get_all()
+    services = plugin_configs["WuwaTappoUID"]["sv"] if "WuwaTappoUID" in plugin_configs else {}
+    if old_name in config_sv:
+        old = config_sv.pop(old_name)
+        for name, pm, _ in SERVICE_COMMANDS:
+            if name not in config_sv and name not in services:
+                config_sv[name] = {**deepcopy(old), "pm": min(old["pm"], pm)}
+        core_config.lazy_set_config("sv", config_sv)
+        if old_name in services:
+            del services[old_name]
+            plugin_config_store.mark_dirty("WuwaTappoUID")
+    elif old_name in services:
+        old = services.pop(old_name)
+        for name, pm, _ in SERVICE_COMMANDS:
+            if name not in services and name not in config_sv:
+                services[name] = {**deepcopy(old), "pm": min(old["pm"], pm)}
+        plugin_config_store.mark_dirty("WuwaTappoUID")
+
+
 async def wt_command(bot: Bot, event: Event) -> None:
     try:
         await execute_command(bot, event)
     except WuwaError as error:
         await bot.send(str(error))
+
+
+migrate_service_config()
+for name, pm, commands in SERVICE_COMMANDS:
+    SV(name, pm=pm).on_command(commands, block=True)(wt_command)
+register_help("WuwaTappoUID", f"{get_plugin_available_prefix('WuwaTappoUID')}帮助")
+_help_images = HelpImageCache()
 
 
 @tracked(lambda: service.runtime)
