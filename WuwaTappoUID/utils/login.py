@@ -34,6 +34,14 @@ def session_key(state: str) -> str:
     return hashlib.sha256(state.encode()).hexdigest()
 
 
+def normalize_login_base(raw: str) -> str:
+    # 缺协议时补 https：登录页要收短信验证码，不能走明文 http
+    base = raw.strip().lstrip("/")
+    if base and "://" not in base:
+        base = "https://" + base
+    return base.rstrip("/")
+
+
 class PendingLoginCheckpoint(BaseModel):
     key: str
     owner_id: str
@@ -69,7 +77,7 @@ class LoginManager:
         if not event.WS_BOT_ID:
             raise WuwaError("当前会话缺少 GS WebSocket 路由，无法保存登录通知目标。")
         use_local = settings.get_config("login_use_local").data
-        base = settings.get_config("login_public_url").data.strip().rstrip("/")
+        base = normalize_login_base(settings.get_config("login_public_url").data)
         if not base and use_local:
             host = core_config.get_config("HOST")
             if host in ("0.0.0.0", "::"):
@@ -78,7 +86,13 @@ class LoginManager:
                 host = f"[{host}]"
             base = f"http://{host}:{core_config.get_config('PORT')}"
         address = urlsplit(base)
-        if address.scheme not in ("http", "https") or not address.netloc or address.query or address.fragment:
+        if (
+            address.scheme not in ("http", "https")
+            or not address.netloc
+            or address.netloc.endswith(":")
+            or address.query
+            or address.fragment
+        ):
             raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
         owner = identity(event.bot_id, event.user_id)
         async with self.service.user_lock(owner):
