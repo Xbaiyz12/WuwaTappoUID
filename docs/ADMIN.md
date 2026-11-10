@@ -69,7 +69,7 @@
 
 **发送登录二维码图片**（`login_send_qrcode`）默认关闭，与WW登录一样发送文字链接；开启后只发送二维码图片，使用浏览器扫描。本地和外置模式均生效，保存后下一次 `wt登录` 使用新设置，无需重启。二维码绘制失败时仍会发送文字链接。
 
-在 GsCore 的 WuwaTappoUID 插件配置中设置 `login_public_url`，填写打开登录页的浏览器能访问到的 HTTP/HTTPS 基础地址，例如 `http://192.168.1.10:8765` 或 `https://login.example.com`，不包含 `/wuwatappouid/login`。本地模式留空时按 GsCore HOST/PORT 生成 HTTP 地址；HOST为0.0.0.0或::时使用127.0.0.1作为本机入口。外置模式必须填写ww-login地址。保留原配置键名以兼容已有配置，不检测或要求公网。
+在 GsCore 的 WuwaTappoUID 插件配置中设置 `login_public_url`，填写打开登录页的浏览器能访问到的基础地址，例如 `192.168.1.10:8765`、`http://192.168.1.10:8765` 或 `https://login.example.com`，只写到域名（可含端口），不包含路径或查询串。可省略协议，默认按 `https` 处理；只有 http 服务的请显式写 `http://`。本地模式留空时按 GsCore HOST/PORT 生成 HTTP 地址；HOST为0.0.0.0或::时使用127.0.0.1作为本机入口。外置模式必须填写ww-login地址。保留原配置键名以兼容已有配置，不检测或要求公网。
 
 本地模式的登录页与提交接口复用 GsCore，页面及接口统一位于 `/wuwatappouid/`。公网使用 HTTPS 反向代理，转发该前缀即可，其余路径返回404；不要将管理控制台和WebSocket入口一并开放。
 
