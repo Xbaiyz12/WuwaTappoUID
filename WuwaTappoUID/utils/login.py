@@ -35,26 +35,11 @@ def session_key(state: str) -> str:
 
 
 def normalize_login_base(raw: str) -> str:
-    # 缺协议时补 https：登录页要收短信验证码，不能走明文 http
+    # 缺协议时按 https 处理，与 XWUID 的登录地址规则一致；明文 http 须写全 http://
     base = raw.strip().lstrip("/")
     if base and "://" not in base:
         base = "https://" + base
-    base = base.rstrip("/")
-    if not base:
-        return ""
-    address = urlsplit(base)
-    # .port 越界会抛 ValueError，提前暴露比发出去一个坏链接好
-    try:
-        address.port
-    except ValueError:
-        raise WuwaError("登录页面地址的端口不合法，请检查后重填。") from None
-    if address.scheme not in ("http", "https") or not address.netloc:
-        raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
-    if address.netloc.endswith(":") or " " in address.netloc:
-        raise WuwaError("登录页面地址格式不正确，请检查主机名与端口。")
-    if address.path or address.query or address.fragment:
-        raise WuwaError("登录页面地址只写到域名（可含端口），不要带路径或查询串。")
-    return base
+    return base.rstrip("/")
 
 
 class PendingLoginCheckpoint(BaseModel):
@@ -100,8 +85,16 @@ class LoginManager:
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
             base = f"http://{host}:{core_config.get_config('PORT')}"
-            # 兜底地址由 HOST/PORT 拼成，同样过一遍校验，避免生成坏链接
-            base = normalize_login_base(base)
+        address = urlsplit(base)
+        # 主机名解析成 http/https 说明协议写错了，例如 http:/host、https//host
+        if (
+            address.scheme not in ("http", "https")
+            or not address.netloc
+            or address.hostname in ("http", "https")
+            or address.query
+            or address.fragment
+        ):
+            raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
         owner = identity(event.bot_id, event.user_id)
         async with self.service.user_lock(owner):
             pending = next((item for item in self._checkpoints.values() if item.owner_id == owner), None)
