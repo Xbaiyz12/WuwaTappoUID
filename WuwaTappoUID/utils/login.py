@@ -42,6 +42,23 @@ def normalize_login_base(raw: str) -> str:
     return base.rstrip("/")
 
 
+def validate_login_base(base: str) -> str:
+    """校验登录地址格式；不合法时直接抛 WuwaError，避免生成坏链接。"""
+    try:
+        address = urlsplit(base)
+        address.port
+    except ValueError:
+        raise WuwaError("登录页面地址格式不正确，请检查主机名与端口。") from None
+    # 主机名解析成 http/https 说明协议写错了，例如 http:/host、https//host
+    if address.scheme not in ("http", "https") or not address.netloc:
+        raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
+    if address.hostname in ("http", "https") or " " in address.netloc or address.netloc.endswith(":"):
+        raise WuwaError("登录页面地址格式不正确，请检查主机名与端口。")
+    if address.path or address.query or address.fragment:
+        raise WuwaError("登录页面地址只写到域名（可含端口），不要带路径或查询串。")
+    return base
+
+
 class PendingLoginCheckpoint(BaseModel):
     key: str
     owner_id: str
@@ -85,16 +102,7 @@ class LoginManager:
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
             base = f"http://{host}:{core_config.get_config('PORT')}"
-        address = urlsplit(base)
-        # 主机名解析成 http/https 说明协议写错了，例如 http:/host、https//host
-        if (
-            address.scheme not in ("http", "https")
-            or not address.netloc
-            or address.hostname in ("http", "https")
-            or address.query
-            or address.fragment
-        ):
-            raise WuwaError("主人尚未配置有效的 HTTP/HTTPS 登录页面地址，请暂用 wt添加token。")
+        base = validate_login_base(base)
         owner = identity(event.bot_id, event.user_id)
         async with self.service.user_lock(owner):
             pending = next((item for item in self._checkpoints.values() if item.owner_id == owner), None)
