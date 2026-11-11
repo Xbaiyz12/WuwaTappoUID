@@ -53,9 +53,14 @@ settings = StringConfig(
         ),
         "retry_limit": GsIntConfig(
             title="后台连续异常阈值",
-            desc="持续后台异常达到此次数后提醒主人并暂停异常处理；不封禁用户或账号命令。",
+            desc="持续后台异常达到此次数后停止重复告警；开启主人告警时发送私聊，不封禁用户命令。",
             data=3,
             max_value=10,
+        ),
+        "master_alerts_enabled": GsBoolConfig(
+            title="发送主人后台异常告警",
+            desc="默认开启。关闭后不发送主人私聊；后台异常计数、处理暂停和日志仍按原规则执行。",
+            data=True,
         ),
     },
 )
@@ -86,3 +91,7 @@ def record_retention_days() -> int:
 
 def retry_limit() -> int:
     return max(1, settings.get_config("retry_limit").data)
+
+
+def master_alerts_enabled() -> bool:
+    return settings.get_config("master_alerts_enabled").data

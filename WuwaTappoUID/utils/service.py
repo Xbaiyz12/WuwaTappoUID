@@ -45,6 +45,7 @@ from .schema import (
     TOKEN_RENEW_WINDOW,
     ApiError,
     AuthenticationError,
+    ClicksUnavailable,
     DatabaseSchemaError,
     DataError,
     Expired,
@@ -375,6 +376,8 @@ class Service:
                         await self.expire_account(account)
                         raise AuthenticationError(TOKEN_EXPIRED_MESSAGE) from None
                     raise
+            if isinstance(error, ApiError) and error.code == 10014:
+                return
             reason = self.error_detail(error)
             await self.failures.fail(failure_key, "后台token续期", reason, account.id, delay=TOKEN_RENEW_RETRY)
             return
@@ -860,6 +863,8 @@ class Service:
         except OperationStopped as error:
             return before, 0, str(error)
         except ApiError as error:
+            if task is not None and error.code == 10014:
+                raise
             problem = str(error)
         except (NetworkError, DataError) as error:
             submission_error = error
@@ -1005,6 +1010,7 @@ class Service:
         await Store.save(task)
         self.unschedule(task.account_id)
         pending = await Store.unresolved(task.account_id)
+        expired_note = ""
         if pending:
             info: UserInfo | None = None
             account = await Store.account(task.account_id)
@@ -1016,15 +1022,20 @@ class Service:
                 except MaintenanceError:
                     pass
                 except WuwaError as error:
-                    await self.failures.fail(
-                        "reconcile:" + account.id,
-                        "结束任务的结果核对",
-                        self.error_detail(error),
-                        account.id,
-                        limit=1
-                        if isinstance(error, DataError) or isinstance(error, ApiError) and error.is_auth
-                        else None,
-                    )
+                    if isinstance(error, ApiError) and error.is_auth:
+                        await self.expire_account(account)
+                        await self.failures.success("reconcile:" + account.id)
+                        expired_note = "\n" + self.expired_message(account, task.owner_id)
+                    elif isinstance(error, ApiError) and error.code == 10014:
+                        pass
+                    else:
+                        await self.failures.fail(
+                            "reconcile:" + account.id,
+                            "结束任务的结果核对",
+                            self.error_detail(error),
+                            account.id,
+                            limit=1 if isinstance(error, DataError) else None,
+                        )
             if info is not None:
                 await self.reconcile(task, info)
             else:
@@ -1039,7 +1050,8 @@ class Service:
                 subscription_id=task.subscription_id,
                 account_id=task.account_id,
                 text=f"{reason}。本轮成功开箱 {task.successes} 个。"
-                + (f"另有 {unresolved_count} 个请求结果待确认，尚未计入。" if unresolved_count else ""),
+                + (f"另有 {unresolved_count} 个请求结果待确认，尚未计入。" if unresolved_count else "")
+                + expired_note,
             ),
         )
 
@@ -1353,7 +1365,9 @@ class Service:
                     await Store.save(record)
                     if delta > 0:
                         continue
-                    raise WuwaError(supplement + "本次未重试开箱。")
+                    raise ClicksUnavailable(supplement + "本次未重试开箱。")
+                if error.code == 70005:
+                    raise ClicksUnavailable(supplement + "再次开箱仍提示点击不足，本轮停止重试。")
                 if error.is_auth:
                     # 先验证原会话，本次不再次提交开箱。
                     await self.refresh(account, fresh=True)
@@ -1455,6 +1469,9 @@ class Service:
                             info = await self.refresh(account)
                             retry = True
                             continue
+                        if error.code in (70004, 10014):
+                            retry = True
+                            break
                         raise
                     if await Store.unresolved(key):
                         retry = True
@@ -1466,6 +1483,20 @@ class Service:
                 await self.finish(task, "expired", "本轮自动开箱已结束")
             except MaintenanceError:
                 retry = True
+            except ClicksUnavailable as error:
+                interrupted = True
+                task.status = "paused"
+                task.pause_reason = "failure"
+                task.paused_at = None
+                await self.failures.success("check:" + key)
+                await Store.save(
+                    task,
+                    Notice(
+                        subscription_id=task.subscription_id,
+                        account_id=key,
+                        text=f"点击不足，自动开箱已暂停。{error}\n请先补足点击，再发送 wt恢复。",
+                    ),
+                )
             except NetworkError as error:
                 # 每轮网络请求自身有有限重试；持续失败也有后台轮次上限。
                 await self.task_failure(task, error)
@@ -1478,24 +1509,27 @@ class Service:
                 await Store.save(task)
                 self.unschedule(key)
             except ApiError as error:
-                interrupted = True
-                if error.is_auth:
-                    account = await Store.account(key)
-                    if account is not None:
-                        try:
-                            await self.refresh(account, fresh=True)
-                        except AuthenticationError:
-                            task.status = "paused"
-                            task.pause_reason = "auth"
-                            await Store.save(task)
-                            self.unschedule(key)
-                        else:
-                            # 业务请求拒绝但账号仍可查询，不标记token过期。
-                            await self.task_failure(task, error)
-                            retry = True
-                else:
-                    await self.task_failure(task, error)
+                if error.code == 10014:
                     retry = True
+                else:
+                    interrupted = True
+                    if error.is_auth:
+                        account = await Store.account(key)
+                        if account is not None:
+                            try:
+                                await self.refresh(account, fresh=True)
+                            except AuthenticationError:
+                                task.status = "paused"
+                                task.pause_reason = "auth"
+                                await Store.save(task)
+                                self.unschedule(key)
+                            else:
+                                # 业务请求拒绝但账号仍可查询，不标记token过期。
+                                await self.task_failure(task, error)
+                                retry = True
+                    else:
+                        await self.task_failure(task, error)
+                        retry = True
             except WuwaError as error:
                 interrupted = True
                 await self.task_failure(task, error)
@@ -1686,14 +1720,18 @@ class Service:
                     except MaintenanceError:
                         continue
                     except Exception as error:
+                        if isinstance(error, ApiError) and error.is_auth:
+                            await self.expire_account(account)
+                            await self.failures.success("reconcile:" + key)
+                            continue
+                        if isinstance(error, ApiError) and error.code == 10014:
+                            continue
                         await self.failures.fail(
                             "reconcile:" + key,
                             "已结束任务的结果核对",
                             self.error_detail(error),
                             key,
-                            limit=1
-                            if isinstance(error, DataError) or isinstance(error, ApiError) and error.is_auth
-                            else None,
+                            limit=1 if isinstance(error, DataError) else None,
                         )
             for key in await Store.result_accounts():
                 if self.account_lock(key).locked() or not self.failures.allows("results:" + key):
@@ -1874,20 +1912,29 @@ class Service:
                     notice for notice in await Store.notices(key) if notice.record_ids and not notice.new_checked
                 ]
                 try:
-                    if not self.failures.allows("notice-bag:" + key):
+                    if account.token_state in ("expired", "recovering"):
+                        items = None
+                        await self.failures.success("notice-bag:" + key)
+                    elif not self.failures.allows("notice-bag:" + key):
                         if not self.failures.blocked("notice-bag:" + key):
                             return
                         items = None
                     else:
                         async with asyncio.timeout(12):
-                            items = await self.api.bags(account.token, fresh=True)
+                            items = await self.read_bag(account, fresh=True)
                     if items is not None:
                         progress = self.cards.progress(items)
                         owned = {str(item.asset_id) for item in items if item.quantity > 0}
                         if unchecked:
                             await Store.prepare_new_items(key, [notice.id for notice in unchecked], owned)
                         await self.failures.success("notice-bag:" + key)
+                except MaintenanceError:
+                    return
+                except AuthenticationError:
+                    await self.failures.success("notice-bag:" + key)
                 except (WuwaError, TimeoutError) as error:
+                    if isinstance(error, ApiError) and error.code == 10014:
+                        return
                     failure = await self.failures.fail(
                         "notice-bag:" + key,
                         "通知背包快照",
@@ -1930,7 +1977,12 @@ class Service:
             return
         contexts = {}
         contents: list[Message] = []
-        if not self.failures.blocked(render_key) and not (unchecked and self.failures.blocked("notice-bag:" + key)):
+        skip_image = unchecked and (
+            self.failures.blocked("notice-bag:" + key)
+            or account is not None
+            and account.token_state in ("expired", "recovering")
+        )
+        if not self.failures.blocked(render_key) and not skip_image:
             try:
                 if any(notice.record_ids for notice in notices) and account is not None:
                     contexts[key] = ResultContext(await self.cards.header(account, None, event), progress)
@@ -1948,7 +2000,10 @@ class Service:
                 if not failure.blocked:
                     return
         if not contents or self.failures.blocked(render_key):
-            contents = [MessageSegment.text("结果图片暂不可用，本组改为文字通知；开箱流水已保留。\n")]
+            fallback = "结果图片暂不可用，本组改为文字通知；开箱流水已保留。\n"
+            if account is not None and account.token_state == "expired":
+                fallback += self.expired_message(account, identity(event.bot_id, event.user_id)) + "\n"
+            contents = [MessageSegment.text(fallback)]
             for notice in notices:
                 text = notice.text.replace(account.cuid, mask_cuid(account.cuid)) if account else notice.text
                 contents.append(MessageSegment.text(text + "\n"))

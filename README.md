@@ -43,3 +43,5 @@ git clone https://github.com/gufei233/WuwaTappoUID.git gsuid_core/plugins/WuwaTa
 登录交互参考 [XutheringWavesUID](https://github.com/Loping151/XutheringWavesUID)，图片布局和素材参考 [XWUIDCollection](https://github.com/Loping151/XWUIDCollection)。[素材说明](WuwaTappoUID/assets/tappo/ATTRIBUTION.md)。所有《鸣潮》角色及素材版权归库洛游戏所有。
 
 首次从 0.1.50 升级到 0.1.51 或更新版本后，请完整重启 GsCore 进程；仅热重载插件不能接管旧运行任务。完成这次重启后，后续版本支持热重载交接。
+
+升级到 0.1.53 以修复已有后台告警时，也请完整重启 GsCore；仅热重载会继承旧实例的失败计数。

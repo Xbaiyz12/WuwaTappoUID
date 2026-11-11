@@ -14,7 +14,7 @@ from gsuid_core.subscribe import gs_subscribe
 from pydantic import BaseModel, Field
 
 from .formatting import date_text, mask_cuid
-from .settings import retry_limit
+from .settings import master_alerts_enabled, retry_limit
 
 ALERT_JOB = "WuwaTappoUID:alerts"
 
@@ -53,6 +53,8 @@ class Failures:
             # 旧命令封禁和告警ID管理状态不再使用；新状态只保存待发送提醒。
             if isinstance(raw.get("alerts"), list):
                 self.state = FailureState.model_validate(raw)
+        if not master_alerts_enabled():
+            await self._discard_alerts()
 
     def allows(self, key: str) -> bool:
         item = self._failures.get(key)
@@ -85,6 +87,11 @@ class Failures:
         async with self._write_lock:
             await asyncio.to_thread(self._write, self.path, self.state.model_dump_json().encode())
 
+    async def _discard_alerts(self) -> None:
+        if self.state.alerts:
+            self.state.alerts.clear()
+            await self._save()
+
     def wake_alerts(self) -> None:
         job = scheduler.get_job(ALERT_JOB)
         if job is not None:
@@ -111,16 +118,19 @@ class Failures:
             target = f"CUID {mask_cuid(account_id.split(':', 1)[-1])}" if account_id else "插件"
             summary = f"{target} · {phase} · 连续后台异常 {item.attempts}/{maximum}"
             if item.blocked:
-                self.state.alerts.append(
-                    MasterAlert(
-                        text=f"WT后台异常提醒\n发生时间：{date_text(time.time())}\n{summary}\n{detail}"
-                        "\n已暂停对应的异常后台处理，请主人检查日志、接口或数据库。任务和原始结果保留。",
-                        account_id=account_id,
+                if master_alerts_enabled():
+                    self.state.alerts.append(
+                        MasterAlert(
+                            text=f"WT后台异常提醒\n发生时间：{date_text(time.time())}\n{summary}\n{detail}"
+                            "\n请主人检查日志、接口或数据库。任务和原始结果保留。",
+                            account_id=account_id,
+                        )
                     )
-                )
-                await self._save()
-                logger.error(f"[WuwaTappoUID] {summary}，已停止重复后台处理并提醒主人。{detail}")
-                self.wake_alerts()
+                    await self._save()
+                    logger.error(f"[WuwaTappoUID] {summary}，已达到告警阈值并提醒主人。{detail}")
+                    self.wake_alerts()
+                else:
+                    logger.error(f"[WuwaTappoUID] {summary}，已达到异常阈值；主人告警已关闭。{detail}")
             elif item.attempts == 1:
                 logger.warning(f"[WuwaTappoUID] {summary}。{detail}")
             else:
@@ -137,10 +147,16 @@ class Failures:
             del self._failures[key]
 
     async def flush_alerts(self) -> None:
-        if not gss.active_bot:
-            return
         async with self._send_lock:
+            if not master_alerts_enabled():
+                await self._discard_alerts()
+                return
+            if not gss.active_bot:
+                return
             for alert in list(self.state.alerts):
+                if not master_alerts_enabled():
+                    await self._discard_alerts()
+                    return
                 if alert.retry_after > time.time():
                     continue
                 alert.attempts += 1
@@ -161,6 +177,9 @@ class Failures:
                         if not targets:
                             raise RuntimeError("主人订阅不可用")
                         for target, sub in targets.items():
+                            if not master_alerts_enabled():
+                                await self._discard_alerts()
+                                return
                             if target in alert.delivered:
                                 continue
                             if await sub.send(alert.text, force_direct=True) != 0:

@@ -98,6 +98,10 @@ class AuthenticationError(WuwaError):
     """登录态失效或尚未验证，停止当前操作。"""
 
 
+class ClicksUnavailable(WuwaError):
+    """自动补充点击后仍无法开箱，交给用户处理。"""
+
+
 class Expired(Exception):
     """本轮已到期，不再提交操作。"""
 
