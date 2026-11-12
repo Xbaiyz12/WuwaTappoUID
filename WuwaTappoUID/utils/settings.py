@@ -36,8 +36,7 @@ settings = StringConfig(
         "login_public_url": GsStrConfig(
             title="登录页面地址",
             desc=(
-                "浏览器可访问的地址，只写到域名（可含端口），不要带路径；"
-                "可省略协议（默认 https，纯 http 服务请显式写 http://）；"
+                "浏览器可访问的地址，可省略协议（默认 https，纯 http 服务请显式写 http://）；"
                 "本地模式留空使用 GsCore HOST/PORT，也可填写反代或隧道地址；外置模式必填 ww-login 地址。"
             ),
             data="",
